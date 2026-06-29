@@ -17,6 +17,12 @@ one OpenAI-compatible API.
 Secure an existing OpenAI app with a one-line base-URL change - self-hosted, no
 data leaves your infrastructure.
 
+<br />
+
+<img src="assets/deepintshield-dashboard.png" alt="DeepintShield dashboard - Analytics Overview showing latency, guardrail latency, cost and savings, requests, tokens, and model-usage charts, with a sidebar for AI Logs, Guardrails, Agentic Policy, Hallucination Control, Caching and Cost, Virtual Keys, and Playground" width="100%" />
+
+<sub><b>The built-in dashboard</b> - real-time analytics for latency, cost and savings, guardrails, requests, tokens, caching, and model usage. Every open-source feature is a one-click toggle with its own tab.</sub>
+
 </div>
 
 ---
