@@ -358,3 +358,5 @@ key.json
 *-key.json
 gha-creds-*.json
 deepintshield_server/ui/package-lock.json
+test.py
+test2.py

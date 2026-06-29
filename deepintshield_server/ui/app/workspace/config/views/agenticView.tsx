@@ -79,8 +79,7 @@ export default function AgenticView() {
 			<Alert variant="default" className="border-blue-20">
 				<Info className="h-4 w-4 text-blue-600" />
 				<AlertDescription>
-					The basic PDP evaluates ABAC rules (Rego / typed-AST) against each <code className="font-mono">/decide</code> request, with an
-					in-process decision cache and an append-only audit. Advanced agentic supply-chain security (AIBOM / code-scan, tool integrity,
+					Advanced agentic supply-chain security (AIBOM / code-scan, tool integrity,
 					ReBAC identity, observability exporters) is available on Cloud / Enterprise.
 				</AlertDescription>
 			</Alert>
