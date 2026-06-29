@@ -17,7 +17,12 @@
       ],
       "regex": [
         "ignore\\s+(all\\s+)?(previous|prior|above)\\s+(instructions|rules|guidelines|messages)",
-        "(bypass|disable|override)\\s+(the\\s+)?(policy|guardrails?|safety|filters?)"
+        "(bypass|disable|override)\\s+(the\\s+)?(policy|guardrails?|safety|filters?)",
+        "forget\\s+(everything\\s+above|all\\s+(previous|prior)|your\\s+(instructions?|rules?|training|programming))",
+        "(stop|cease)\\s+(following|obeying)\\s+(your\\s+|the\\s+)?(previous|prior|system)?\\s*(instructions?|rules?)",
+        "no\\s+longer\\s+(bound\\s+by|follow|obey)\\s+(your\\s+|the\\s+)?(instructions?|rules?|guidelines?)",
+        "your\\s+(new|real|true|only)\\s+(task|instructions?|role|purpose)\\s+(is|are)",
+        "from\\s+now\\s+on[,]?\\s+(ignore|disregard|forget|you\\s+(are|will|must)|act|pretend)"
       ]
     },
     "system_prompt_extraction": {
@@ -33,7 +38,10 @@
       ],
       "regex": [
         "(reveal|show|print|dump|repeat)\\s+(the\\s+)?(system prompt|developer message|hidden instructions|internal rules)",
-        "what\\s+(is|are)\\s+(your\\s+)?(system prompt|developer instructions|hidden rules)"
+        "what\\s+(is|are)\\s+(your\\s+)?(system prompt|developer instructions|hidden rules)",
+        "(repeat|print|show|reveal|output|display|tell\\s+me|echo|recite)\\s+(the\\s+|your\\s+|me\\s+the\\s+)?(exact\\s+|verbatim\\s+|full\\s+|initial\\s+|original\\s+)?(your\\s+|the\\s+)?(system\\s+|developer\\s+|initial\\s+|original\\s+|hidden\\s+)?(prompt|instructions?|message|rules?|directives?|system\\s+message)",
+        "(repeat|print|output|show)\\s+(everything|the\\s+(words?|text))\\s+(above|before\\s+this|preceding)",
+        "what\\s+(is|are|were)\\s+(your\\s+)?(exact\\s+|original\\s+|initial\\s+|system\\s+|full\\s+)?(prompt|instructions?|directives?|system\\s+message)"
       ]
     },
     "indirect_document_injection": {
@@ -181,7 +189,9 @@
         "display your prompt"
       ],
       "regex": [
-        "(show|reveal|print|display)\\s+(the\\s+)?(developer message|internal instructions|hidden rules|system prompt)"
+        "(show|reveal|print|display)\\s+(the\\s+)?(developer message|internal instructions|hidden rules|system prompt)",
+        "(repeat|reveal|print|show|display|output|echo)\\s+(the\\s+|your\\s+)?(system\\s+|initial\\s+|original\\s+|hidden\\s+|developer\\s+)?(prompt|instructions?|message|rules?)",
+        "(repeat|print)\\s+(everything|the\\s+(words?|text))\\s+(above|before\\s+this)"
       ]
     },
     "role_discovery": {
@@ -373,7 +383,14 @@
       ],
       "regex": [
         "ignore\\s+previous\\s+instructions",
-        "(override|bypass)\\s+(the\\s+)?(policy|guardrails?|safety)"
+        "(override|bypass)\\s+(the\\s+)?(policy|guardrails?|safety)",
+        "ignore\\s+(the\\s+|all\\s+|any\\s+|your\\s+)?(above\\s+|prior\\s+|previous\\s+|earlier\\s+|system\\s+)?(instructions?|rules?|guidelines?|directives?|prompts?|policy|policies)",
+        "disregard\\s+(the\\s+|all\\s+|your\\s+)?(above\\s+|prior\\s+|previous\\s+|system\\s+)?(instructions?|rules?|guidelines?|policy)",
+        "forget\\s+(everything\\s+above|all\\s+previous|your\\s+(instructions?|rules?|training|programming))",
+        "(disable|turn\\s+off|bypass|override|ignore)\\s+(your\\s+|all\\s+|the\\s+)?(safety|content)?\\s*(guidelines?|filters?|restrictions?|rules?|guardrails?|moderation|policy)",
+        "you\\s+(have|are\\s+under)\\s+no\\s+(restrictions?|limitations?|rules?|guidelines?|filters?)",
+        "(enable|activate)\\s+(dan|developer|jailbreak)\\s+mode",
+        "pretend\\s+(you|the\\s+rules?)\\s+(have\\s+no|are\\s+(not|no\\s+longer))"
       ]
     },
     "prompt_leakage": {
@@ -491,7 +508,6 @@
         "policy\\s+holder\\s+(email|phone|address)"
       ]
     },
-
     "ms_prompt_injection_direct_override": {
       "literals": [],
       "regex": [
@@ -501,7 +517,18 @@
         "disregard\\s+(all\\s+)?(above|prior|previous|earlier)",
         "override\\s+(the\\s+)?(previous\\s+)?(system\\s+)?instructions",
         "do\\s+not\\s+follow\\s+(your\\s+)?(previous|prior|system)\\s+instructions",
-        "\\bnew\\s+instructions\\s*:"
+        "\\bnew\\s+instructions\\s*:",
+        "ignore\\s+(the\\s+|all\\s+|any\\s+|your\\s+)?(above\\s+|prior\\s+|previous\\s+|earlier\\s+|preceding\\s+|system\\s+|foregoing\\s+)?(instructions?|rules?|guidelines?|directives?|prompts?|messages?|policy|policies|constraints?|directions?|commands?)",
+        "disregard\\s+(the\\s+|all\\s+|any\\s+|your\\s+)?(above\\s+|prior\\s+|previous\\s+|earlier\\s+|preceding\\s+|system\\s+)?(instructions?|rules?|guidelines?|directives?|prompts?|messages?|policy|policies|constraints?)",
+        "forget\\s+(everything\\s+(above|before)|all\\s+(the\\s+)?(previous|prior|above)|the\\s+(above|previous|prior)\\s+(instructions?|rules?|context|prompt)|your\\s+(instructions?|rules?|guidelines?|training|programming|prompt|directives?)|what\\s+(i|we|you)\\s+(said|told|discussed))",
+        "(neglect|skip|drop|abandon|set\\s+aside|cast\\s+aside|put\\s+aside)\\s+(the\\s+|all\\s+|any\\s+|your\\s+)?(above\\s+|prior\\s+|previous\\s+|system\\s+)?(instructions?|rules?|guidelines?|directives?|constraints?|restrictions?|policy|policies)",
+        "(stop|cease|quit)\\s+(following|obeying|adhering\\s+to|complying\\s+with)\\s+(your\\s+|the\\s+)?(previous|prior|system|above|earlier|original)?\\s*(instructions?|rules?|guidelines?|policy|directives?)",
+        "no\\s+longer\\s+(have\\s+to\\s+|need\\s+to\\s+)?(follow|obey|adhere\\s+to|comply\\s+with|are\\s+bound\\s+by|bound\\s+by)\\s+(your\\s+|the\\s+)?(previous|prior|system|original)?\\s*(instructions?|rules?|guidelines?|policy|directives?)",
+        "(reset|clear|wipe|erase|delete|flush)\\s+(your\\s+|the\\s+|all\\s+)?(instructions?|memory|context|rules?|guidelines?|prior\\s+context|conversation\\s+history)",
+        "your\\s+(new|real|actual|true|only|sole)\\s+(task|instructions?|directive|directives|role|purpose|job|goal|mission)\\s+(is|are)",
+        "(overrule|supersede|supercede|replace)\\s+(the\\s+|all\\s+|any\\s+)?(previous\\s+|prior\\s+|system\\s+|above\\s+)?(instructions?|rules?|guidelines?|policy|policies|directives?)",
+        "instructions?\\s+(above|below)\\s+(this\\s+line\\s+)?(are|is)\\s+(void|null|cancel?led|revoked|no\\s+longer\\s+valid|invalid|fake|wrong)",
+        "from\\s+now\\s+on[,]?\\s+(you|ignore|disregard|forget|act|pretend|respond|reply|answer|do\\s+not|don'?t|you'?re|you\\s+are|you\\s+will|you\\s+must|you\\s+should|behave)"
       ]
     },
     "ms_prompt_injection_delimiter_attack": {
@@ -513,7 +540,13 @@
         "<</?SYS>>",
         "(?m)^\\s*(system|assistant|user)\\s*:",
         "-{3,}\\s*(system|begin|end)\\b",
-        "```\\s*(system|new\\s+context|instructions)"
+        "```\\s*(system|new\\s+context|instructions)",
+        "</?(system|assistant|user|im_start|im_end|inst|sys)\\s*>",
+        "\\[\\s*/?\\s*(system|assistant|user|inst|sys)\\s*\\]",
+        "###\\s*(system|instruction|new\\s+(instruction|prompt|context|session)|reset)",
+        "(?m)^\\s*(developer|tool|function)\\s*[:>]",
+        "(begin|end|start)\\s+of\\s+(the\\s+)?(system\\s+)?(prompt|instructions?|message)\\b",
+        "\\{\\{\\s*(system|prompt|instructions?)\\s*\\}\\}"
       ]
     },
     "ms_prompt_injection_roleplay_jailbreak": {
@@ -525,7 +558,22 @@
         "developer\\s+mode\\s+(enabled|on|override)",
         "bypass\\s+(all\\s+)?(the\\s+)?(safety|content|security)\\s*(filters?|policy|controls?)?",
         "you\\s+have\\s+no\\s+(restrictions|limitations|rules|guidelines)",
-        "act\\s+as\\s+(an?\\s+)?(admin|root|developer|superuser)"
+        "act\\s+as\\s+(an?\\s+)?(admin|root|developer|superuser)",
+        "\\b(evil\\s+confidant|jailbreak\\s+mode|god\\s+mode|sudo\\s+mode|do\\s+anything\\s+now)\\b",
+        "(enable|activate|enter|turn\\s+on|switch\\s+to|engage)\\s+(dan|developer|jailbreak|god|sudo|admin|root|unrestricted|unfiltered|uncensored|debug)\\s+mode",
+        "(unfiltered|uncensored|unrestricted|no[\\s-]?filter|filterless)\\s+(mode|ai|assistant|model|version|response|chatbot|gpt)",
+        "you\\s+(are|will\\s+be|can\\s+be)\\s+(now\\s+)?(free|unrestricted|unfiltered|uncensored|jailbroken|liberated)\\b",
+        "pretend\\s+(that\\s+)?(you|the\\s+rules?|restrictions?|guidelines?|safety|filters?)\\s+(have\\s+no|are\\s+(no\\s+longer|not|disabled|gone|off)|don'?t\\s+(exist|apply)|do\\s+not\\s+(exist|apply))",
+        "(roleplay|role[\\s-]?play|simulate|imagine|picture)\\s+(as\\s+|that\\s+you('?re|\\s+are)\\s+|being\\s+|yourself\\s+as\\s+)?(an?\\s+)?(unrestricted|jailbroken|evil|unfiltered|uncensored|amoral|malicious|villain|hacker|criminal|rogue)",
+        "respond\\s+as\\s+(if\\s+you\\s+(were|are|had)\\s+)?(an?\\s+)?(unrestricted|jailbroken|amoral|unfiltered|uncensored|evil|malicious)",
+        "(disable|turn\\s+off|remove|strip|drop|lift|suspend)\\s+(your\\s+|all\\s+|any\\s+|the\\s+)?(safety|content|ethical|moral|security)?\\s*(guidelines?|policy|policies|filters?|restrictions?|rules?|programming|protocols?|guardrails?|moderation|censorship|limits?|limitations?)",
+        "(ignore|forget|bypass|override|circumvent)\\s+(your\\s+|all\\s+|any\\s+|the\\s+)?(safety|content|ethical|moral|security|community)\\s+(guidelines?|policy|policies|filters?|restrictions?|rules?|protocols?|standards?)",
+        "there\\s+(are|is)\\s+no\\s+(rules?|restrictions?|limits?|limitations?|guidelines?|boundaries|consequences|filters?)\\b",
+        "(anything|everything)\\s+is\\s+(allowed|permitted|permissible|legal|fine)\\b",
+        "you\\s+can\\s+(do|say|generate|write|produce)\\s+(anything|whatever)\\b",
+        "you\\s+(have|are\\s+under)\\s+no\\s+(restrictions?|limitations?|rules?|guidelines?|filters?|boundaries|constraints?|morals?|ethics)\\b",
+        "(without|free\\s+(from|of))\\s+(any\\s+)?(ethical|moral|legal|content|safety)\\s+(restrictions?|considerations?|guidelines?|constraints?|filters?|limits?|boundaries)",
+        "act\\s+(as\\s+(if\\s+)?)?(you\\s+(have|are)\\s+)?(no|without\\s+(any\\s+)?)\\s*(restrictions?|rules?|filters?|guidelines?|limits?|morals?|ethics)\\b"
       ]
     },
     "ms_prompt_injection_encoding_obfuscation": {
@@ -537,7 +585,10 @@
         "\\brot13\\b",
         "base64\\s*(-?\\s*)?decode",
         "hex\\s*(-?\\s*)?decode",
-        "decode\\s+(this|the\\s+following).{0,20}(and\\s+)?(run|execute|follow)"
+        "decode\\s+(this|the\\s+following).{0,20}(and\\s+)?(run|execute|follow)",
+        "(respond|reply|answer|encode|output|write|translate)\\s+(in|using|with|to)\\s+(base64|rot13|rot[\\s-]?13|hex(adecimal)?|binary|morse(\\s+code)?|leet[\\s-]?speak|l33t|pig\\s+latin)",
+        "\\b(morse\\s+code|leet[\\s-]?speak|pig\\s+latin)\\b",
+        "(decode|decrypt|unscramble|deobfuscate)\\s+(this|the\\s+following|it)[\\s\\S]{0,30}(then|and|to)\\s+(execute|run|follow|do|reply|respond|answer|comply)"
       ]
     },
     "ms_prompt_injection_context_manipulation": {
@@ -546,7 +597,11 @@
         "the\\s+above\\s+instructions\\s+are\\s+(wrong|incorrect|fake)",
         "your\\s+(real|true|actual)\\s+(instructions|purpose|goal)\\s+(is|are)",
         "the\\s+(developer|admin|owner)\\s+told\\s+me\\s+to\\s+tell\\s+you",
-        "actually\\s+your\\s+(real\\s+)?instructions\\s+are"
+        "actually\\s+your\\s+(real\\s+)?instructions\\s+are",
+        "the\\s+(previous|last|prior)\\s+(message|instruction|response|line|paragraph)\\s+(was|is|came)\\s+(from\\s+(the\\s+)?(developer|admin|system|owner|moderator)|fake|wrong|incorrect|a\\s+mistake|not\\s+real)",
+        "(i\\s+am|i'?m|this\\s+is)\\s+(the\\s+|your\\s+)?(developer|admin|administrator|owner|system|creator|operator|engineer)[\\s\\S]{0,40}(you\\s+(must|should|can|may|need|will)|ignore|reveal|bypass|disable|grant|override|now\\s+you)",
+        "(hypothetical|fictional|imaginary)\\s+(scenario|setting|story|world|situation)[\\s\\S]{0,70}(ignore|no\\s+(rules?|restrictions?|filters?)|without\\s+(restrictions?|rules?)|anything\\s+(is\\s+)?(allowed|goes)|bypass|how\\s+(to|do\\s+i)\\s+(make|build|create|synthesi[sz]e|hack|steal))",
+        "for\\s+(educational|research|academic)\\s+purposes\\s+(only)?[\\s\\S]{0,50}(ignore|bypass|no\\s+restrictions?|how\\s+(to|do)\\s+(i\\s+)?(make|build|create|synthesi[sz]e|hack))"
       ]
     },
     "ms_prompt_injection_multi_turn_escalation": {
@@ -563,7 +618,11 @@
       "regex": [
         "(repeat|print|show|reveal|output)\\s+(the\\s+)?(system|above|initial)\\s+(prompt|instructions)",
         "what\\s+(are|were)\\s+your\\s+(initial\\s+|original\\s+)?instructions",
-        "CANARY_[A-Za-z0-9]{4,}|SENTINEL_[A-Za-z0-9]{4,}"
+        "CANARY_[A-Za-z0-9]{4,}|SENTINEL_[A-Za-z0-9]{4,}",
+        "(repeat|print|show|reveal|output|display|tell\\s+me|give\\s+me|echo|reproduce|recite|state|spell\\s+out)\\s+(the\\s+|your\\s+|me\\s+the\\s+|us\\s+the\\s+|back\\s+the\\s+)?(exact\\s+|verbatim\\s+|complete\\s+|full\\s+|entire\\s+|original\\s+|initial\\s+)?(your\\s+|the\\s+)?(system\\s+|developer\\s+|initial\\s+|original\\s+|above\\s+|preceding\\s+|first\\s+|hidden\\s+|secret\\s+)?(prompt|instructions?|message|rules?|guidelines?|directives?|configuration|system\\s+message)",
+        "what\\s+(is|are|were|was)\\s+(your\\s+)?(the\\s+)?(exact\\s+|original\\s+|initial\\s+|system\\s+|full\\s+|complete\\s+|first\\s+|hidden\\s+)?(prompt|instructions?|guidelines?|directives?|system\\s+message|system\\s+prompt)",
+        "(repeat|print|output|show|display|reproduce)\\s+(everything|all\\s+(the\\s+)?(text|words?|content)|the\\s+(words?|text|content|message|lines?))\\s+(above|before\\s+this|prior\\s+to\\s+this|preceding|that\\s+came\\s+before)",
+        "(summari[sz]e|paraphrase)\\s+(your\\s+)?(system\\s+)?(prompt|instructions?|directives?)"
       ]
     },
     "ms_rag_memory_poisoning": {
