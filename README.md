@@ -2,7 +2,7 @@
 
 <img src="assets/deepintshield-logo.png" alt="DeepintShield" width="440" />
 
-### The open-source AI security gateway
+### The Fastest open-source AI Security Gateway
 
 **Govern, secure, and control every GenAI action** - decide what your agents and
 LLM calls are allowed to do, then route, govern, and observe every request behind
@@ -13,6 +13,10 @@ one OpenAI-compatible API.
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](https://go.dev)
 [![Providers](https://img.shields.io/badge/providers-24%2B-success)](#supported-providers)
 [![npx](https://img.shields.io/badge/run-npx-cb3837?logo=npm)](#quick-start)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Deepint-Shield/ai-security?quickstart=1)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/Deepint-Shield/ai-security/badge)](https://securityscorecards.dev/viewer/?uri=github.com/Deepint-Shield/ai-security)
+[![Signed with cosign](https://img.shields.io/badge/signed%20with-cosign-blue?logo=sigstore&logoColor=white)](https://github.com/Deepint-Shield/ai-security/releases)
+[![SBOM](https://img.shields.io/badge/SBOM-SPDX%20%2B%20CycloneDX-success?logo=anchore&logoColor=white)](https://github.com/Deepint-Shield/ai-security/releases/latest)
 
 Secure an existing OpenAI app with a one-line base-URL change - self-hosted, no
 data leaves your infrastructure.
@@ -200,6 +204,33 @@ Open `http://localhost:8080`, add a provider key and create a virtual key in the
 UI, then send OpenAI-compatible requests. Any OpenAI SDK works - set its
 `base_url` to the gateway and use the virtual key as the bearer token.
 
+### Run with Docker Compose
+
+For a one-command quick start that runs the gateway together with a Redis Stack
+vector store (so the semantic cache works out of the box), use the top-level
+`compose.yaml`. It runs the **published** image - no build step.
+
+```bash
+# Fetch the compose file and start everything.
+curl -fsSL https://raw.githubusercontent.com/Deepint-Shield/ai-security/main/compose.yaml -o compose.yaml
+docker compose up -d
+```
+
+Then open `http://localhost:8080`, add a provider key, and create a virtual key
+in the UI.
+
+What it runs:
+
+- **`deepintshield`** - the published `deepintshield/ai-security:latest` gateway on port `8080`, with `/app/data` (SQLite config + logs) persisted in a named volume.
+- **`redis`** - `redis/redis-stack-server:latest`, which ships RediSearch (required by the semantic cache). The gateway waits for Redis to be healthy via `depends_on`.
+
+Stop and clean up:
+
+```bash
+docker compose down        # stop containers, keep data
+docker compose down -v     # also remove the named volumes (wipes config + logs)
+```
+
 ### Run with Docker
 
 The `docker run` above uses the published image. To build and run the **all-in-one
@@ -221,6 +252,34 @@ Then open `http://localhost:8080` and configure a provider + virtual key as abov
 - **Use your own Redis:** add `-e DEEPINTSHIELD_REDIS_ADDR=host:6379` (the bundled one stays idle).
 - **No Redis at all:** the gateway still starts - semantic caching simply turns off; routing, guardrails, prompt/exact caching, and the rest keep working.
 - **Inject a config file:** mount it and set `-e DEEPINTSHIELD_CONFIG_FILE=/path/in/container/config.json`, or pass it inline with `-e DEEPINTSHIELD_CONFIG='{ ... }'`.
+
+### Develop in the cloud (Codespaces)
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/Deepint-Shield/ai-security?quickstart=1)
+
+Spin up a fully provisioned dev environment in the browser - no local Go, gcc, or
+Node setup. The [`.devcontainer`](./.devcontainer) gives you Go 1.26 with a C
+toolchain (CGO is required for the embedded SQLite driver) and Node 20 for the
+dashboard build.
+
+When the codespace finishes its `postCreateCommand`, the dashboard UI and the
+gateway binary are already built. To start the gateway:
+
+```bash
+cd deepintshield_server
+make run          # builds (if needed) and runs the gateway on :8080
+```
+
+Or run the prebuilt binary directly (bind to 0.0.0.0 so Codespaces can forward
+the port):
+
+```bash
+./deepintshield_server/tmp/deepintshield-http -host 0.0.0.0 -port 8080
+```
+
+Port **8080** is forwarded automatically - open it from the **Ports** tab to
+reach the API and the built-in dashboard. Point any OpenAI-compatible client at
+the forwarded `https://...-8080.app.github.dev/v1` URL.
 
 ### Deploy to the cloud
 
@@ -414,6 +473,36 @@ cd transports && go run ./deepintshield-http -app-dir /tmp/deepintshield-data -p
 See the Helm chart under
 [`deepintshield_server/helm-charts/deepintshield`](./deepintshield_server/helm-charts/deepintshield)
 for Kubernetes deployment.
+
+## Supply-chain security
+
+Every tagged release is produced by a hardened, reproducible GitHub Actions pipeline and ships with verifiable provenance:
+
+- **Keyless signatures (Sigstore / cosign).** Every binary, the binary checksum manifest, and the multi-arch Docker image are signed with [cosign](https://github.com/sigstore/cosign) in keyless mode - no private keys are stored anywhere. Signatures are bound to the GitHub Actions OIDC identity of this repo's `Release` workflow and logged in the public Rekor transparency log.
+- **SBOMs.** Each release attaches a Software Bill of Materials in both SPDX (`sbom.spdx.json`) and CycloneDX (`sbom.cyclonedx.json`) formats, generated from source with [anchore/sbom-action](https://github.com/anchore/sbom-action).
+- **OpenSSF Scorecard.** Continuous automated assessment of our security posture; results are published to the repo's Security tab and the badge above.
+
+### Verify a release binary
+
+```bash
+# Download the binary, its .sig, and its .pem from the GitHub Release, then:
+cosign verify-blob \
+  --certificate deepintshield-http-linux-amd64.pem \
+  --signature  deepintshield-http-linux-amd64.sig \
+  --certificate-identity-regexp 'https://github.com/Deepint-Shield/ai-security/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  deepintshield-http-linux-amd64
+```
+
+### Verify the Docker image
+
+```bash
+cosign verify deepintshield/ai-security:latest \
+  --certificate-identity-regexp 'https://github.com/Deepint-Shield/ai-security/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+```
+
+A non-zero exit (or `cosign` printing anything other than a verified signature) means the artifact does not match this repository's release pipeline - do not trust it.
 
 ## Community & contributing
 

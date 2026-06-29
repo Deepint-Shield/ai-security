@@ -1,0 +1,46 @@
+{
+  "name": "DeepintShield AI Security Gateway",
+  // Go 1.26 base image ships build-essential / gcc, which CGO needs:
+  // gorm's sqlite driver (mattn/go-sqlite3) compiles C at build time.
+  "image": "mcr.microsoft.com/devcontainers/go:1.26",
+  "features": {
+    // The Next.js dashboard (deepintshield_server/ui) builds with Node.
+    // The release workflow pins Node 20; match it here.
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    }
+  },
+  // The gateway listens on :8080 (Makefile PORT default).
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": {
+      "label": "DeepintShield Gateway (API + Dashboard)",
+      "onAutoForward": "notify"
+    }
+  },
+  // Build the embedded UI, then the CGO gateway binary, so the codespace is
+  // ready to `make run` (or run ./tmp/deepintshield-http) immediately.
+  // Kept resilient: a failure here should not block opening the workspace.
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode"
+      ],
+      "settings": {
+        "go.toolsManagement.autoUpdate": true,
+        // CGO is mandatory for this repo (sqlite); make sure gopls/build agree.
+        "go.toolsEnvVars": {
+          "CGO_ENABLED": "1"
+        },
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+  "remoteEnv": {
+    // mattn/go-sqlite3 requires cgo; enforce it for every Go invocation.
+    "CGO_ENABLED": "1"
+  }
+}

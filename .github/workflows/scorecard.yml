@@ -1,0 +1,70 @@
+name: OpenSSF Scorecard
+
+# Runs the OpenSSF Scorecard security posture analysis on this repository and
+# publishes the results to the GitHub code-scanning (Security) tab. On the
+# default branch the run also uploads results to the public OpenSSF API so the
+# README badge (api.securityscorecards.dev) stays current.
+#
+# Keyless / OIDC: `id-token: write` lets Scorecard fetch a Sigstore OIDC token
+# to publish results - no stored secrets are required on a public repo.
+
+on:
+  # Re-evaluate after merges to the default branch (badge + dashboard refresh).
+  push:
+    branches: ["main"]
+  # Branch-protection rule changes only emit this event; catch them too.
+  branch_protection_rule:
+  # Weekly scheduled re-scan so findings stay fresh even without pushes.
+  schedule:
+    - cron: "27 3 * * 1"
+  # Allow manual runs from the Actions tab.
+  workflow_dispatch:
+
+# Top-level permissions are read-only; the analysis job widens only what it needs.
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    # Skip on forks: the OIDC publish + code-scanning upload only make sense on
+    # the canonical repo, and forks lack the required token.
+    if: github.repository == 'Deepint-Shield/ai-security'
+    permissions:
+      # Upload SARIF results to the code-scanning (Security) tab.
+      security-events: write
+      # Fetch the Sigstore OIDC token used to publish results to the public API.
+      id-token: write
+      # Read repo contents and (for the badge) read actions/branch-protection.
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # publish_results=true uploads to the public OpenSSF API so the
+          # README badge resolves. This needs id-token: write (above) and a
+          # push/schedule/dispatch event on the default branch - it is a no-op
+          # for pull_request events. No PAT is required for public repos.
+          publish_results: true
+
+      # Keep the raw SARIF as a build artifact for debugging / offline review.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorecard-results
+          path: results.sarif
+          retention-days: 5
+
+      # Surface findings in the repository's Security > Code scanning alerts.
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif

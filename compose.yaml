@@ -1,0 +1,50 @@
+# DeepIntShield AI Security Gateway - Docker Compose quick start.
+#
+#   docker compose up -d
+#   open http://localhost:8080
+#
+# Runs the published gateway image plus a Redis Stack server. Redis Stack
+# ships RediSearch, which the semantic cache requires; without it the gateway
+# still runs but semantic caching is disabled.
+services:
+  deepintshield:
+    image: deepintshield/ai-security:latest
+    container_name: deepintshield
+    ports:
+      - "8080:8080"
+    environment:
+      APP_PORT: "8080"
+      APP_HOST: "0.0.0.0"
+      LOG_LEVEL: "info"
+      LOG_STYLE: "json"
+      # Wire the gateway to the Redis Stack service for the semantic cache.
+      DEEPINTSHIELD_REDIS_ADDR: "redis:6379"
+    volumes:
+      # Persist the SQLite config + logs under /app/data across restarts.
+      - deepintshield_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  redis:
+    # Redis Stack includes RediSearch, which is required for the semantic cache.
+    image: redis/redis-stack-server:latest
+    container_name: deepintshield-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  deepintshield_data:
+  redis_data:

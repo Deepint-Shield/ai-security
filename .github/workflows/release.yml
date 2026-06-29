@@ -171,6 +171,9 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # keyless cosign OIDC token (Sigstore) - no stored keys
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -187,6 +190,71 @@ jobs:
           prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
           files: dist/*
           generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      # --- Supply-chain: SBOM generation (source) -----------------------------
+      - name: Checkout source for SBOM
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          path: src
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: src
+          format: spdx-json
+          output-file: dist/sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: src
+          format: cyclonedx-json
+          output-file: dist/sbom.cyclonedx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      # --- Supply-chain: keyless signing of binaries + checksums + SBOMs ------
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign release artifacts (keyless / Sigstore OIDC)
+        shell: bash
+        working-directory: dist
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          # Sign every artifact except signature/cert sidecars: each binary,
+          # each .sha256, and both SBOMs. Keyless: GitHub OIDC -> Fulcio cert
+          # (.pem) + Rekor log; detached signature -> <file>.sig.
+          shopt -s nullglob
+          for f in *; do
+            case "$f" in
+              *.sig|*.pem) continue ;;
+            esac
+            [ -f "$f" ] || continue
+            echo "Signing $f"
+            cosign sign-blob \
+              --output-signature "$f.sig" \
+              --output-certificate "$f.pem" \
+              "$f"
+          done
+          ls -lh
+
+      - name: Attach SBOMs + signatures to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
+          files: |
+            dist/sbom.spdx.json
+            dist/sbom.cyclonedx.json
+            dist/*.sig
+            dist/*.pem
           fail_on_unmatched_files: true
 
   # 4. Stamp the wrapper version from the tag and publish to npm.
@@ -332,6 +400,9 @@ jobs:
     needs: docker
     if: needs.docker.outputs.enabled == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # keyless cosign OIDC token (Sigstore) - no stored keys
     steps:
       - name: Resolve image tags
         id: tags
@@ -369,6 +440,22 @@ jobs:
         run: |
           docker buildx imagetools create ${{ steps.tags.outputs.tags }} \
             $(printf '${{ steps.tags.outputs.image }}@sha256:%s ' *)
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Sign multi-arch image (keyless / Sigstore OIDC)
+        shell: bash
+        env:
+          COSIGN_YES: "true"
+          IMAGE: ${{ steps.tags.outputs.image }}
+          VERSION: ${{ steps.tags.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Sign the immutable manifest-list digest (not the mutable tag) so the
+          # signature can never drift from a retag. Keyless: OIDC -> Fulcio -> Rekor.
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
+            --format '{{.Manifest.Digest}}')"
+          echo "Signing ${IMAGE}@${DIGEST}"
+          cosign sign "${IMAGE}@${DIGEST}"
       - name: Inspect
         run: |
           docker buildx imagetools inspect ${{ steps.tags.outputs.image }}:${{ steps.tags.outputs.version }}
