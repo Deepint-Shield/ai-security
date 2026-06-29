@@ -1,0 +1,104 @@
+package handlers
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/bytedance/sonic"
+	deepintshield "github.com/deepint-shield/ai-security/core"
+	"github.com/deepint-shield/ai-security/core/schemas"
+	"github.com/deepint-shield/ai-security/transports/deepintshield-http/lib"
+	"github.com/fasthttp/router"
+	"github.com/valyala/fasthttp"
+)
+
+type MCPInferenceHandler struct {
+	client *deepintshield.DeepIntShield
+	store  *lib.Config
+}
+
+// NewMCPInferenceHandler creates a new MCP inference handler instance.
+func NewMCPInferenceHandler(client *deepintshield.DeepIntShield, store *lib.Config) *MCPInferenceHandler {
+	return &MCPInferenceHandler{
+		client: client,
+		store:  store,
+	}
+}
+
+// RegisterRoutes registers the MCP inference routes
+func (h *MCPInferenceHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.DeepIntShieldHTTPMiddleware) {
+	r.POST("/v1/mcp/tool/execute", lib.ChainMiddlewares(h.executeTool, middlewares...))
+}
+
+// executeTool handles POST /v1/mcp/tool/execute - Execute MCP tool
+func (h *MCPInferenceHandler) executeTool(ctx *fasthttp.RequestCtx) {
+	// Check format query parameter
+	format := strings.ToLower(string(ctx.QueryArgs().Peek("format")))
+	switch format {
+	case "chat", "":
+		h.executeChatMCPTool(ctx)
+	case "responses":
+		h.executeResponsesMCPTool(ctx)
+	default:
+		SendError(ctx, fasthttp.StatusBadRequest, "Invalid format value, must be 'chat' or 'responses'")
+		return
+	}
+}
+
+// executeChatMCPTool handles POST /v1/mcp/tool/execute?format=chat - Execute MCP tool
+func (h *MCPInferenceHandler) executeChatMCPTool(ctx *fasthttp.RequestCtx) {
+	var req schemas.ChatAssistantMessageToolCall
+	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
+		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid request format: %v", err))
+		return
+	}
+
+	// Validate required fields
+	if req.Function.Name == nil || *req.Function.Name == "" {
+		SendError(ctx, fasthttp.StatusBadRequest, "Tool function name is required")
+		return
+	}
+
+	// Convert context
+	deepintshieldCtx, cancel := lib.ConvertToDeepIntShieldContext(ctx, false, h.store.GetHeaderMatcher())
+	defer cancel() // Ensure cleanup on function exit
+	if deepintshieldCtx == nil {
+		SendError(ctx, fasthttp.StatusBadRequest, "Failed to convert context")
+		return
+	}
+	result, deepintshieldErr := h.client.ExecuteChatMCPTool(deepintshieldCtx, &req)
+	if deepintshieldErr != nil {
+		SendDeepIntShieldError(ctx, deepintshieldErr)
+		return
+	}
+	SendJSON(ctx, result)
+}
+
+// executeResponsesMCPTool handles POST /v1/mcp/tool/execute?format=responses - Execute MCP tool
+func (h *MCPInferenceHandler) executeResponsesMCPTool(ctx *fasthttp.RequestCtx) {
+	var req schemas.ResponsesToolMessage
+	if err := sonic.Unmarshal(ctx.PostBody(), &req); err != nil {
+		SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("Invalid request format: %v", err))
+		return
+	}
+
+	// Validate required fields
+	if req.Name == nil || *req.Name == "" {
+		SendError(ctx, fasthttp.StatusBadRequest, "Tool function name is required")
+		return
+	}
+
+	// Convert context
+	deepintshieldCtx, cancel := lib.ConvertToDeepIntShieldContext(ctx, false, h.store.GetHeaderMatcher())
+	defer cancel() // Ensure cleanup on function exit
+	if deepintshieldCtx == nil {
+		SendError(ctx, fasthttp.StatusBadRequest, "Failed to convert context")
+		return
+	}
+	result, deepintshieldErr := h.client.ExecuteResponsesMCPTool(deepintshieldCtx, &req)
+	if deepintshieldErr != nil {
+		SendDeepIntShieldError(ctx, deepintshieldErr)
+		return
+	}
+	SendJSON(ctx, result)
+}

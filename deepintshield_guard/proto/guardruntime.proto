@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+package deepintshield.guardruntime.v1;
+
+option go_package = "github.com/deepint-shield/ai-security-guard/proto;guardruntimepb";
+
+service GuardRuntime {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc RefreshTenant(RefreshTenantRequest) returns (RefreshTenantResponse);
+  rpc EvaluateInput(EvaluateRequest) returns (EvaluateResponse);
+  rpc EvaluateOutput(EvaluateRequest) returns (EvaluateResponse);
+  rpc EvaluateAction(EvaluateRequest) returns (EvaluateResponse);
+  rpc EvaluateMCP(EvaluateRequest) returns (EvaluateResponse);
+  rpc EvaluateRAG(EvaluateRequest) returns (EvaluateResponse);
+}
+
+message PingRequest {}
+
+message PingResponse {
+  bool ok = 1;
+  string service = 2;
+  string time = 3;
+}
+
+message RefreshTenantRequest {
+  string tenant_id = 1;
+}
+
+message RefreshTenantResponse {
+  bool ok = 1;
+  string tenant_id = 2;
+  string message = 3;
+}
+
+message Actor {
+  string type = 1;
+  string id = 2;
+  string role = 3;
+}
+
+message MCPContext {
+  string server_label = 1;
+  string tool_name = 2;
+  string action_class = 3;
+  repeated string domains = 4;
+}
+
+message Content {
+  string input = 1;
+  string output = 2;
+  string tool_input = 3;
+  // Non-text artifacts (images, audio, video, documents) carried alongside the
+  // textual fields. The runtime's modality-extraction stage turns these into
+  // text folded into input/output before the text detectors run. Optional;
+  // omitted by callers that send text only.
+  repeated Attachment attachments = 4;
+}
+
+// Attachment is a single non-text artifact submitted for modality-aware
+// guardrail evaluation. Exactly one of text/data/ref is the source of truth, in
+// that precedence order.
+message Attachment {
+  string kind = 1; // image | audio | video | document
+  string mime = 2; // e.g. image/png, audio/mpeg
+  string role = 3; // input | output (default input)
+  string hash = 4; // sha256 hex content fingerprint, used for dedup
+  string text = 5; // pre-extracted text, if the gateway already has it
+  bytes data = 6;  // inlined raw bytes (capped); empty when ref/text suffices
+  string ref = 7;  // external reference (URL) when bytes are not inlined
+}
+
+message PolicyBundle {
+  string policy_id = 1;
+  string policy_version_id = 2;
+  string name = 3;
+  string scope = 4;
+  string enforcement_mode = 5;
+  map<string, string> definition = 6;
+}
+
+message EvaluateRequest {
+  string tenant_id = 1;
+  string request_id = 2;
+  string stage = 3;
+  string model = 4;
+  string provider = 5;
+  Actor actor = 6;
+  Content content = 7;
+  MCPContext mcp = 8;
+  repeated PolicyBundle policies = 9;
+}
+
+message Finding {
+  string policy_id = 1;
+  string policy_version_id = 2;
+  string category = 3;
+  string severity = 4;
+  double confidence = 5;
+  string outcome = 6;
+  string summary = 7;
+}
+
+message EvaluateResponse {
+  string decision = 1;
+  string reason = 2;
+  bool approval_required = 3;
+  repeated string redactions = 4;
+  string sanitized_input = 5;
+  string sanitized_output = 6;
+  repeated Finding findings = 7;
+  repeated string decision_chain = 8;
+  int32 latency_ms = 9;
+}

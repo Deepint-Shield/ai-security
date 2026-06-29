@@ -1,0 +1,43 @@
+{
+  "name": "@deepintshield/ai-security",
+  "version": "0.1.1",
+  "description": "DeepintShield - the open-source, OpenAI-compatible AI gateway. Route, secure, cache, and observe LLM traffic. This package downloads the prebuilt gateway binary for your platform and runs it.",
+  "keywords": [
+    "ai",
+    "gateway",
+    "llm",
+    "openai",
+    "anthropic",
+    "proxy",
+    "guardrails",
+    "observability",
+    "deepintshield"
+  ],
+  "homepage": "https://github.com/deepint-shield/ai-security#readme",
+  "bugs": {
+    "url": "https://github.com/deepint-shield/ai-security/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepint-shield/ai-security.git",
+    "directory": "npx/ai-security"
+  },
+  "license": "Apache-2.0",
+  "author": "DeepintShield",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "ai-security": "bin.js",
+    "deepintshield": "bin.js"
+  },
+  "files": [
+    "bin.js",
+    "README.md"
+  ],
+  "type": "module",
+  "dependencies": {}
+}

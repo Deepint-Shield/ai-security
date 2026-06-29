@@ -1,0 +1,27 @@
+{
+  "$schema": "https://deepintshield.com/schema",
+  "config_store": {
+    "enabled": true,
+    "type": "postgres",
+    "config": {
+      "host": "localhost",
+      "port": "5432",
+      "user": "deepintshield",
+      "password": "deepintshield_password",
+      "db_name": "deepintshield",
+      "ssl_mode": "disable"
+    }
+  },
+  "logs_store": {
+    "enabled": true,
+    "type": "postgres",
+    "config": {
+      "host": "localhost",
+      "port": "5432",
+      "user": "deepintshield",
+      "password": "deepintshield_password",
+      "db_name": "deepintshield",
+      "ssl_mode": "disable"
+    }
+  }
+}

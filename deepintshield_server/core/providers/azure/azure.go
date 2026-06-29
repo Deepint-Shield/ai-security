@@ -1,0 +1,3116 @@
+// Package azure implements the Azure provider.
+package azure
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"mime/multipart"
+	"net/http"
+	"net/url"
+	"sync"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/bytedance/sonic"
+	"github.com/deepint-shield/ai-security/core/providers/anthropic"
+	"github.com/deepint-shield/ai-security/core/providers/openai"
+	providerUtils "github.com/deepint-shield/ai-security/core/providers/utils"
+	schemas "github.com/deepint-shield/ai-security/core/schemas"
+
+	"github.com/valyala/fasthttp"
+)
+
+// AzureAuthorizationTokenKey is the context key for the Azure authentication token.
+const AzureAuthorizationTokenKey schemas.DeepIntShieldContextKey = "azure-authorization-token"
+
+// DefaultAzureScope is the default scope for Azure authentication.
+const DefaultAzureScope = "https://cognitiveservices.azure.com/.default"
+
+// AzureProvider implements the Provider interface for Azure's API.
+type AzureProvider struct {
+	logger        schemas.Logger        // Logger for provider operations
+	client        *fasthttp.Client      // HTTP client for API requests
+	networkConfig schemas.NetworkConfig // Network configuration including extra headers
+
+	credentials         sync.Map // map of tenant ID:client ID to azcore.TokenCredential
+	sendBackRawRequest  bool     // Whether to include raw request in DeepIntShieldResponse
+	sendBackRawResponse bool     // Whether to include raw response in DeepIntShieldResponse
+}
+
+func (p *AzureProvider) getOrCreateAuth(
+	tenantID, clientID, clientSecret string,
+) (azcore.TokenCredential, error) {
+	key := tenantID + ":" + clientID
+
+	// Fast path
+	if val, ok := p.credentials.Load(key); ok {
+		return val.(azcore.TokenCredential), nil
+	}
+
+	// Slow path - create new credential
+	cred, err := azidentity.NewClientSecretCredential(
+		tenantID,
+		clientID,
+		clientSecret,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	actual, _ := p.credentials.LoadOrStore(key, cred)
+	return actual.(azcore.TokenCredential), nil
+}
+
+// getOrCreateDefaultAzureCredential returns a DefaultAzureCredential, creating and caching it if needed.
+// It automatically detects the auth environment: managed identity on Azure VMs/containers,
+// workload identity in AKS, environment variables, Azure CLI, and more.
+func (p *AzureProvider) getOrCreateDefaultAzureCredential() (azcore.TokenCredential, error) {
+	const cacheKey = "default_azure_credential"
+
+	if val, ok := p.credentials.Load(cacheKey); ok {
+		return val.(azcore.TokenCredential), nil
+	}
+
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	actual, _ := p.credentials.LoadOrStore(cacheKey, cred)
+	return actual.(azcore.TokenCredential), nil
+}
+
+// getAzureAuthHeaders returns authentication headers based on priority:
+// 1. Service Principal (client ID/secret/tenant ID) - Bearer token
+// 2. Context token - Bearer token
+// 3. API key - api-key or x-api-key header
+func (provider *AzureProvider) getAzureAuthHeaders(ctx *schemas.DeepIntShieldContext, key schemas.Key, isAnthropicModel bool) (map[string]string, *schemas.DeepIntShieldError) {
+	authHeader := make(map[string]string)
+
+	// Service Principal authentication
+	if key.AzureKeyConfig != nil && key.AzureKeyConfig.ClientID != nil &&
+		key.AzureKeyConfig.ClientSecret != nil && key.AzureKeyConfig.TenantID != nil && key.AzureKeyConfig.ClientID.GetValue() != "" && key.AzureKeyConfig.ClientSecret.GetValue() != "" && key.AzureKeyConfig.TenantID.GetValue() != "" {
+		cred, err := provider.getOrCreateAuth(key.AzureKeyConfig.TenantID.GetValue(), key.AzureKeyConfig.ClientID.GetValue(), key.AzureKeyConfig.ClientSecret.GetValue())
+		if err != nil {
+			return nil, providerUtils.NewDeepIntShieldOperationError("failed to get or create Azure authentication", err, schemas.Azure)
+		}
+
+		scopes := getAzureScopes(key.AzureKeyConfig.Scopes)
+
+		token, err := cred.GetToken(ctx, policy.TokenRequestOptions{
+			Scopes: scopes,
+		})
+		if err != nil {
+			return nil, providerUtils.NewDeepIntShieldOperationError("failed to get Azure access token", err, schemas.Azure)
+		}
+
+		if token.Token == "" {
+			return nil, providerUtils.NewDeepIntShieldOperationError("Azure access token is empty", errors.New("token is empty"), schemas.Azure)
+		}
+
+		authHeader["Authorization"] = fmt.Sprintf("Bearer %s", token.Token)
+		return authHeader, nil
+	}
+
+	// Context token authentication
+	if authToken, ok := ctx.Value(AzureAuthorizationTokenKey).(string); ok && authToken != "" {
+		authHeader["Authorization"] = fmt.Sprintf("Bearer %s", authToken)
+		return authHeader, nil
+	}
+
+	value := key.Value.GetValue()
+	if value == "" {
+		// No explicit credentials provided - attempt DefaultAzureCredential auto-detection.
+		// This covers managed identity on Azure VMs/containers, workload identity in AKS,
+		// environment variables, Azure CLI, and more - with no config required.
+		scopes := getAzureScopes(nil)
+		if key.AzureKeyConfig != nil {
+			scopes = getAzureScopes(key.AzureKeyConfig.Scopes)
+		}
+
+		cred, err := provider.getOrCreateDefaultAzureCredential()
+		if err != nil {
+			return nil, providerUtils.NewDeepIntShieldOperationError("no credentials provided and DefaultAzureCredential unavailable", err, schemas.Azure)
+		}
+
+		token, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: scopes})
+		if err != nil {
+			return nil, providerUtils.NewDeepIntShieldOperationError("no credentials provided and DefaultAzureCredential failed to get token", err, schemas.Azure)
+		}
+
+		if token.Token == "" {
+			return nil, providerUtils.NewDeepIntShieldOperationError("no credentials provided and DefaultAzureCredential returned empty token", errors.New("token is empty"), schemas.Azure)
+		}
+
+		authHeader["Authorization"] = fmt.Sprintf("Bearer %s", token.Token)
+		return authHeader, nil
+	}
+
+	// API key authentication
+	if isAnthropicModel {
+		authHeader["x-api-key"] = value
+	} else {
+		authHeader["api-key"] = value
+	}
+	return authHeader, nil
+}
+
+// NewAzureProvider creates a new Azure provider instance.
+// It initializes the HTTP client with the provided configuration and sets up response pools.
+// The client is configured with timeouts, concurrency limits, and optional proxy settings.
+func NewAzureProvider(config *schemas.ProviderConfig, logger schemas.Logger) (*AzureProvider, error) {
+	config.CheckAndSetDefaults()
+
+	requestTimeout := time.Second * time.Duration(config.NetworkConfig.DefaultRequestTimeoutInSeconds)
+	client := &fasthttp.Client{
+		ReadTimeout:         requestTimeout,
+		WriteTimeout:        requestTimeout,
+		MaxConnsPerHost:     config.NetworkConfig.MaxConnsPerHost,
+		MaxIdleConnDuration: 30 * time.Second,
+		MaxConnWaitTimeout:  requestTimeout,
+		MaxConnDuration:     time.Second * time.Duration(schemas.DefaultMaxConnDurationInSeconds),
+		ConnPoolStrategy:    fasthttp.FIFO,
+	}
+
+	// Configure proxy and retry policy
+	client = providerUtils.ConfigureProxy(client, config.ProxyConfig, logger)
+	client = providerUtils.ConfigureDialer(client)
+	client = providerUtils.ConfigureTLS(client, config.NetworkConfig, logger)
+	return &AzureProvider{
+		logger:              logger,
+		client:              client,
+		networkConfig:       config.NetworkConfig,
+		sendBackRawRequest:  config.SendBackRawRequest,
+		sendBackRawResponse: config.SendBackRawResponse,
+	}, nil
+}
+
+// GetProviderKey returns the provider identifier for Azure.
+func (provider *AzureProvider) GetProviderKey() schemas.ModelProvider {
+	return schemas.Azure
+}
+
+// completeRequest sends a request to Azure's API and handles the response.
+// It constructs the API URL, sets up authentication, and processes the response.
+// Returns the response body, request latency, or an error if the request fails.
+func (provider *AzureProvider) completeRequest(
+	ctx *schemas.DeepIntShieldContext,
+	jsonData []byte,
+	path string,
+	key schemas.Key,
+	deployment string,
+	model string,
+	requestType schemas.RequestType,
+) ([]byte, string, time.Duration, map[string]string, *schemas.DeepIntShieldError) {
+	// Create the request with the JSON body
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	respOwned := true
+	defer func() {
+		if respOwned {
+			fasthttp.ReleaseResponse(resp)
+		}
+	}()
+
+	// Set any extra headers from network config
+	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+	req.Header.SetMethod(http.MethodPost)
+	req.Header.SetContentType("application/json")
+
+	var url string
+	isAnthropicModel := schemas.IsAnthropicModel(deployment)
+
+	// Get authentication headers
+	authHeaders, deepintshieldErr := provider.getAzureAuthHeaders(ctx, key, isAnthropicModel)
+	if deepintshieldErr != nil {
+		return nil, deployment, 0, nil, deepintshieldErr
+	}
+
+	// Apply headers to request
+	for k, v := range authHeaders {
+		req.Header.Set(k, v)
+	}
+
+	endpoint := key.AzureKeyConfig.Endpoint.GetValue()
+	if endpoint == "" {
+		return nil, deployment, 0, nil, providerUtils.NewConfigurationError("endpoint not set", provider.GetProviderKey())
+	}
+
+	if isAnthropicModel {
+		req.Header.Set("anthropic-version", AzureAnthropicAPIVersionDefault)
+		url = fmt.Sprintf("%s/%s", endpoint, path)
+	} else {
+		apiVersion := key.AzureKeyConfig.APIVersion
+		if apiVersion == nil {
+			apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+		}
+		if path == "openai/v1/responses" {
+			url = fmt.Sprintf("%s/%s?api-version=preview", endpoint, path)
+		} else {
+			url = fmt.Sprintf("%s/%s?api-version=%s", endpoint, path, apiVersion.GetValue())
+		}
+	}
+
+	req.SetRequestURI(url)
+	if !providerUtils.ApplyLargePayloadRequestBodyWithModelNormalization(ctx, req, schemas.OpenAI) {
+		req.SetBody(jsonData)
+	}
+
+	// Send the request with optional large response streaming
+	activeClient := providerUtils.PrepareResponseStreaming(ctx, provider.client, resp)
+	latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, activeClient, req, resp)
+	defer wait()
+	if deepintshieldErr != nil {
+		return nil, deployment, latency, nil, deepintshieldErr
+	}
+
+	// Extract provider response headers before body is copied - do this before status check
+	// so error responses also carry provider headers (rate-limit info, request IDs, etc.)
+	providerResponseHeaders := providerUtils.ExtractProviderResponseHeaders(resp)
+
+	// Handle error response
+	if resp.StatusCode() != fasthttp.StatusOK {
+		providerUtils.MaterializeStreamErrorBody(ctx, resp)
+		return nil, deployment, latency, providerResponseHeaders, openai.ParseOpenAIError(resp, requestType, provider.GetProviderKey(), model)
+	}
+
+	body, isLargeResp, decodeErr := providerUtils.FinalizeResponseWithLargeDetection(ctx, resp, provider.GetProviderKey(), provider.logger)
+	if decodeErr != nil {
+		return nil, deployment, latency, providerResponseHeaders, decodeErr
+	}
+	if isLargeResp {
+		respOwned = false
+		return nil, deployment, latency, providerResponseHeaders, nil
+	}
+
+	return body, deployment, latency, providerResponseHeaders, nil
+}
+
+// listModelsByKey performs a list models request for a single key.
+// Returns the response and latency, or an error if the request fails.
+func (provider *AzureProvider) listModelsByKey(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldListModelsRequest) (*schemas.DeepIntShieldListModelsResponse, *schemas.DeepIntShieldError) {
+	// Validate Azure key configuration
+	if key.AzureKeyConfig == nil {
+		return nil, providerUtils.NewConfigurationError("azure key config not set", schemas.Azure)
+	}
+
+	if key.AzureKeyConfig.Endpoint.GetValue() == "" {
+		return nil, providerUtils.NewConfigurationError("endpoint not set", schemas.Azure)
+	}
+
+	// Get API version
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+	}
+
+	// Create the request
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	// Set any extra headers from network config
+	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+
+	req.SetRequestURI(key.AzureKeyConfig.Endpoint.GetValue() + providerUtils.GetPathFromContext(ctx, fmt.Sprintf("/openai/models?api-version=%s", apiVersion.GetValue())))
+	req.Header.SetMethod(http.MethodGet)
+	req.Header.SetContentType("application/json")
+
+	// Set Azure authentication
+	authHeaders, deepintshieldErr := provider.getAzureAuthHeaders(ctx, key, false)
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+	for k, v := range authHeaders {
+		req.Header.Set(k, v)
+	}
+
+	// Send the request and measure latency
+	latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+	defer wait()
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	// Store provider response headers in context before status check so error responses also forward them
+	ctx.SetValue(schemas.DeepIntShieldContextKeyProviderResponseHeaders, providerUtils.ExtractProviderResponseHeaders(resp))
+
+	// Handle error response
+	if resp.StatusCode() != fasthttp.StatusOK {
+		return nil, openai.ParseOpenAIError(resp, schemas.ListModelsRequest, provider.GetProviderKey(), "")
+	}
+
+	body, err := providerUtils.CheckAndDecodeBody(resp)
+	if err != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderResponseDecode, err, provider.GetProviderKey())
+	}
+
+	// Read the response body and copy it before releasing the response
+	// to avoid use-after-free since resp.Body() references fasthttp's internal buffer
+	responseBody := append([]byte(nil), body...)
+
+	// Parse Azure-specific response
+	azureResponse := &AzureListModelsResponse{}
+	rawRequest, rawResponse, deepintshieldErr := providerUtils.HandleProviderResponse(responseBody, azureResponse, nil, providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest), providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse))
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	// Convert to DeepIntShield response
+	response := azureResponse.ToDeepIntShieldListModelsResponse(key.Models, key.AzureKeyConfig.Deployments, request.Unfiltered)
+	if response == nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError("failed to convert Azure model list response", nil, schemas.Azure)
+	}
+
+	response.ExtraFields.Latency = latency.Milliseconds()
+
+	// Set raw request if enabled
+	if providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest) {
+		response.ExtraFields.RawRequest = rawRequest
+	}
+
+	// Set raw response if enabled
+	if providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse) {
+		response.ExtraFields.RawResponse = rawResponse
+	}
+
+	return response, nil
+}
+
+// ListModels performs a list models request to Azure's API.
+// It retrieves all models accessible by the Azure resource
+// Requests are made concurrently for improved performance.
+func (provider *AzureProvider) ListModels(ctx *schemas.DeepIntShieldContext, keys []schemas.Key, request *schemas.DeepIntShieldListModelsRequest) (*schemas.DeepIntShieldListModelsResponse, *schemas.DeepIntShieldError) {
+	return providerUtils.HandleMultipleListModelsRequests(
+		ctx,
+		keys,
+		request,
+		provider.listModelsByKey,
+	)
+}
+
+// TextCompletion performs a text completion request to Azure's API.
+// It formats the request, sends it to Azure, and processes the response.
+// Returns a DeepIntShieldResponse containing the completion results or an error if the request fails.
+func (provider *AzureProvider) TextCompletion(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldTextCompletionRequest) (*schemas.DeepIntShieldTextCompletionResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment, err := provider.getModelDeployment(key, request.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	// Use centralized OpenAI text converter (Azure is OpenAI-compatible)
+	jsonData, deepintshieldErr := providerUtils.CheckContextAndGetRequestBody(
+		ctx,
+		request,
+		func() (providerUtils.RequestBodyWithExtraParams, error) {
+			return openai.ToOpenAITextCompletionRequest(request), nil
+		},
+		provider.GetProviderKey())
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	responseBody, deployment, latency, providerResponseHeaders, err := provider.completeRequest(
+		ctx,
+		jsonData,
+		fmt.Sprintf("openai/deployments/%s/completions", deployment),
+		key,
+		deployment,
+		request.Model,
+		schemas.TextCompletionRequest,
+	)
+	if providerResponseHeaders != nil {
+		ctx.SetValue(schemas.DeepIntShieldContextKeyProviderResponseHeaders, providerResponseHeaders)
+	}
+	if err != nil {
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	// Large response mode: return lightweight response with metadata only
+	if isLargeResp, _ := ctx.Value(schemas.DeepIntShieldContextKeyLargeResponseMode).(bool); isLargeResp {
+		return &schemas.DeepIntShieldTextCompletionResponse{
+			Model: request.Model,
+			ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+				Provider:                provider.GetProviderKey(),
+				ModelRequested:          request.Model,
+				ModelDeployment:         deployment,
+				RequestType:             schemas.TextCompletionRequest,
+				Latency:                 latency.Milliseconds(),
+				ProviderResponseHeaders: providerResponseHeaders,
+			},
+		}, nil
+	}
+
+	response := &schemas.DeepIntShieldTextCompletionResponse{}
+
+	rawRequest, rawResponse, deepintshieldErr := providerUtils.HandleProviderResponse(responseBody, response, jsonData, providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest), providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse))
+	if deepintshieldErr != nil {
+		return nil, providerUtils.EnrichError(ctx, deepintshieldErr, jsonData, responseBody, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	response.ExtraFields.Provider = provider.GetProviderKey()
+	response.ExtraFields.ModelRequested = request.Model
+	response.ExtraFields.ModelDeployment = deployment
+	response.ExtraFields.RequestType = schemas.TextCompletionRequest
+	response.ExtraFields.Latency = latency.Milliseconds()
+	response.ExtraFields.ProviderResponseHeaders = providerResponseHeaders
+
+	// Set raw request if enabled
+	if providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest) {
+		response.ExtraFields.RawRequest = rawRequest
+	}
+
+	// Set raw response if enabled
+	if providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse) {
+		response.ExtraFields.RawResponse = rawResponse
+	}
+
+	return response, nil
+}
+
+// TextCompletionStream performs a streaming text completion request to Azure's API.
+// It formats the request, sends it to Azure, and processes the response.
+// Returns a channel of DeepIntShieldStreamChunk objects or an error if the request fails.
+func (provider *AzureProvider) TextCompletionStream(ctx *schemas.DeepIntShieldContext, postHookRunner schemas.PostHookRunner, key schemas.Key, request *schemas.DeepIntShieldTextCompletionRequest) (chan *schemas.DeepIntShieldStreamChunk, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment := key.AzureKeyConfig.Deployments[request.Model]
+	if deployment == "" {
+		return nil, providerUtils.NewConfigurationError(fmt.Sprintf("deployment not found for model %s", request.Model), provider.GetProviderKey())
+	}
+
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+	}
+
+	url := fmt.Sprintf("%s/openai/deployments/%s/completions?api-version=%s", key.AzureKeyConfig.Endpoint.GetValue(), deployment, apiVersion.GetValue())
+
+	// Get Azure authentication headers
+	authHeader, err := provider.getAzureAuthHeaders(ctx, key, false)
+	if err != nil {
+		return nil, err
+	}
+
+	customPostResponseConverter := func(response *schemas.DeepIntShieldTextCompletionResponse) *schemas.DeepIntShieldTextCompletionResponse {
+		response.ExtraFields.ModelDeployment = deployment
+		return response
+	}
+
+	return openai.HandleOpenAITextCompletionStreaming(
+		ctx,
+		provider.client,
+		url,
+		request,
+		authHeader,
+		provider.networkConfig.ExtraHeaders,
+		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		provider.GetProviderKey(),
+		nil,
+		postHookRunner,
+		nil,
+		customPostResponseConverter,
+		provider.logger,
+	)
+}
+
+// ChatCompletion performs a chat completion request to Azure's API.
+// It formats the request, sends it to Azure, and processes the response.
+// Returns a DeepIntShieldResponse containing the completion results or an error if the request fails.
+func (provider *AzureProvider) ChatCompletion(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldChatRequest) (*schemas.DeepIntShieldChatResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment, err := provider.getModelDeployment(key, request.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	jsonData, deepintshieldErr := providerUtils.CheckContextAndGetRequestBody(
+		ctx,
+		request,
+		func() (providerUtils.RequestBodyWithExtraParams, error) {
+			if schemas.IsAnthropicModel(deployment) {
+				reqBody, err := anthropic.ToAnthropicChatRequest(ctx, request)
+				if err != nil {
+					return nil, err
+				}
+				if reqBody != nil {
+					reqBody.Model = deployment
+					// Add provider-aware beta headers for Azure
+					anthropic.AddMissingBetaHeadersToContext(ctx, reqBody, schemas.Azure)
+				}
+				return reqBody, nil
+			} else {
+				return openai.ToOpenAIChatRequest(ctx, request), nil
+			}
+		},
+		provider.GetProviderKey())
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	var path string
+	if schemas.IsAnthropicModel(deployment) {
+		path = "anthropic/v1/messages"
+	} else {
+		path = fmt.Sprintf("openai/deployments/%s/chat/completions", deployment)
+	}
+
+	responseBody, deployment, latency, providerResponseHeaders, err := provider.completeRequest(
+		ctx,
+		jsonData,
+		path,
+		key,
+		deployment,
+		request.Model,
+		schemas.ChatCompletionRequest,
+	)
+	if providerResponseHeaders != nil {
+		ctx.SetValue(schemas.DeepIntShieldContextKeyProviderResponseHeaders, providerResponseHeaders)
+	}
+	if err != nil {
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	// Large response mode: return lightweight response with metadata only
+	if isLargeResp, _ := ctx.Value(schemas.DeepIntShieldContextKeyLargeResponseMode).(bool); isLargeResp {
+		return &schemas.DeepIntShieldChatResponse{
+			Model: request.Model,
+			ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+				Provider:                provider.GetProviderKey(),
+				ModelRequested:          request.Model,
+				ModelDeployment:         deployment,
+				RequestType:             schemas.ChatCompletionRequest,
+				Latency:                 latency.Milliseconds(),
+				ProviderResponseHeaders: providerResponseHeaders,
+			},
+		}, nil
+	}
+
+	response := &schemas.DeepIntShieldChatResponse{}
+	var rawRequest interface{}
+	var rawResponse interface{}
+
+	if schemas.IsAnthropicModel(deployment) {
+		anthropicResponse := anthropic.AcquireAnthropicMessageResponse()
+		defer anthropic.ReleaseAnthropicMessageResponse(anthropicResponse)
+		rawRequest, rawResponse, deepintshieldErr = providerUtils.HandleProviderResponse(responseBody, anthropicResponse, jsonData, providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest), providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse))
+		if deepintshieldErr != nil {
+			return nil, providerUtils.EnrichError(ctx, deepintshieldErr, jsonData, responseBody, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		}
+		response = anthropicResponse.ToDeepIntShieldChatResponse(ctx)
+	} else {
+		rawRequest, rawResponse, deepintshieldErr = providerUtils.HandleProviderResponse(responseBody, response, jsonData, providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest), providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse))
+		if deepintshieldErr != nil {
+			return nil, providerUtils.EnrichError(ctx, deepintshieldErr, jsonData, responseBody, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		}
+	}
+
+	response.ExtraFields.Provider = provider.GetProviderKey()
+	response.ExtraFields.ModelRequested = request.Model
+	response.ExtraFields.ModelDeployment = deployment
+	response.ExtraFields.Latency = latency.Milliseconds()
+	response.ExtraFields.ProviderResponseHeaders = providerResponseHeaders
+	response.ExtraFields.RequestType = schemas.ChatCompletionRequest
+
+	// Set raw request if enabled
+	if providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest) {
+		response.ExtraFields.RawRequest = rawRequest
+	}
+
+	// Set raw response if enabled
+	if providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse) {
+		response.ExtraFields.RawResponse = rawResponse
+	}
+
+	return response, nil
+}
+
+// ChatCompletionStream performs a streaming chat completion request to Azure's API.
+// It supports real-time streaming of responses using Server-Sent Events (SSE).
+// Uses Azure-specific URL construction with deployments and supports both api-key and Bearer token authentication.
+// Returns a channel containing DeepIntShieldResponse objects representing the stream or an error if the request fails.
+func (provider *AzureProvider) ChatCompletionStream(ctx *schemas.DeepIntShieldContext, postHookRunner schemas.PostHookRunner, key schemas.Key, request *schemas.DeepIntShieldChatRequest) (chan *schemas.DeepIntShieldStreamChunk, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment, err := provider.getModelDeployment(key, request.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	postResponseConverter := func(response *schemas.DeepIntShieldChatResponse) *schemas.DeepIntShieldChatResponse {
+		response.ExtraFields.ModelDeployment = deployment
+		return response
+	}
+
+	var url string
+	if schemas.IsAnthropicModel(deployment) {
+		authHeader, err := provider.getAzureAuthHeaders(ctx, key, true)
+		if err != nil {
+			return nil, err
+		}
+		authHeader["anthropic-version"] = AzureAnthropicAPIVersionDefault
+		url = fmt.Sprintf("%s/anthropic/v1/messages", key.AzureKeyConfig.Endpoint.GetValue())
+
+		jsonData, err := providerUtils.CheckContextAndGetRequestBody(
+			ctx,
+			request,
+			func() (providerUtils.RequestBodyWithExtraParams, error) {
+				reqBody, err := anthropic.ToAnthropicChatRequest(ctx, request)
+				if err != nil {
+					return nil, err
+				}
+				if reqBody != nil {
+					reqBody.Model = deployment
+					reqBody.Stream = schemas.Ptr(true)
+					// Add provider-aware beta headers for Azure
+					anthropic.AddMissingBetaHeadersToContext(ctx, reqBody, schemas.Azure)
+				}
+				return reqBody, nil
+			},
+			provider.GetProviderKey())
+		if err != nil {
+			return nil, err
+		}
+
+		// Use shared streaming logic from Anthropic
+		return anthropic.HandleAnthropicChatCompletionStreaming(
+			ctx,
+			provider.client,
+			url,
+			jsonData,
+			authHeader,
+			provider.networkConfig.ExtraHeaders,
+			providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+			provider.GetProviderKey(),
+			postHookRunner,
+			postResponseConverter,
+			provider.logger,
+			&providerUtils.RequestMetadata{
+				Provider:    provider.GetProviderKey(),
+				Model:       request.Model,
+				RequestType: schemas.ChatCompletionStreamRequest,
+			},
+		)
+	} else {
+		authHeader, err := provider.getAzureAuthHeaders(ctx, key, false)
+		if err != nil {
+			return nil, err
+		}
+		apiVersion := key.AzureKeyConfig.APIVersion
+		if apiVersion == nil {
+			apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+		}
+		url = fmt.Sprintf("%s/openai/deployments/%s/chat/completions?api-version=%s", key.AzureKeyConfig.Endpoint.GetValue(), deployment, apiVersion.GetValue())
+
+		// Use shared streaming logic from OpenAI
+		return openai.HandleOpenAIChatCompletionStreaming(
+			ctx,
+			provider.client,
+			url,
+			request,
+			authHeader,
+			provider.networkConfig.ExtraHeaders,
+			providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+			provider.GetProviderKey(),
+			postHookRunner,
+			nil,
+			nil,
+			nil,
+			nil,
+			postResponseConverter,
+			provider.logger,
+		)
+	}
+}
+
+// Responses performs a responses request to Azure's API.
+// It formats the request, sends it to Azure, and processes the response.
+// Returns a DeepIntShieldResponse containing the completion results or an error if the request fails.
+func (provider *AzureProvider) Responses(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldResponsesRequest) (*schemas.DeepIntShieldResponsesResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment, err := provider.getModelDeployment(key, request.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	var jsonData []byte
+	var deepintshieldErr *schemas.DeepIntShieldError
+	if schemas.IsAnthropicModel(deployment) {
+		jsonData, deepintshieldErr = getRequestBodyForAnthropicResponses(ctx, request, deployment, provider.GetProviderKey(), false)
+	} else {
+		jsonData, deepintshieldErr = providerUtils.CheckContextAndGetRequestBody(
+			ctx,
+			request,
+			func() (providerUtils.RequestBodyWithExtraParams, error) {
+				reqBody := openai.ToOpenAIResponsesRequest(request)
+				if reqBody != nil {
+					reqBody.Model = deployment
+				}
+				return reqBody, nil
+			},
+			provider.GetProviderKey())
+	}
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	var path string
+	if schemas.IsAnthropicModel(deployment) {
+		path = "anthropic/v1/messages"
+	} else {
+		path = "openai/v1/responses"
+	}
+
+	responseBody, deployment, latency, providerResponseHeaders, err := provider.completeRequest(
+		ctx,
+		jsonData,
+		path,
+		key,
+		deployment,
+		request.Model,
+		schemas.ResponsesRequest,
+	)
+	if providerResponseHeaders != nil {
+		ctx.SetValue(schemas.DeepIntShieldContextKeyProviderResponseHeaders, providerResponseHeaders)
+	}
+	if err != nil {
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	// Large response mode: return lightweight response with metadata only
+	if isLargeResp, _ := ctx.Value(schemas.DeepIntShieldContextKeyLargeResponseMode).(bool); isLargeResp {
+		return &schemas.DeepIntShieldResponsesResponse{
+			Model: request.Model,
+			ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+				Provider:                provider.GetProviderKey(),
+				ModelRequested:          request.Model,
+				ModelDeployment:         deployment,
+				RequestType:             schemas.ResponsesRequest,
+				Latency:                 latency.Milliseconds(),
+				ProviderResponseHeaders: providerResponseHeaders,
+			},
+		}, nil
+	}
+
+	response := &schemas.DeepIntShieldResponsesResponse{}
+	var rawRequest interface{}
+	var rawResponse interface{}
+
+	if schemas.IsAnthropicModel(deployment) {
+		anthropicResponse := anthropic.AcquireAnthropicMessageResponse()
+		defer anthropic.ReleaseAnthropicMessageResponse(anthropicResponse)
+		rawRequest, rawResponse, deepintshieldErr = providerUtils.HandleProviderResponse(responseBody, anthropicResponse, jsonData, providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest), providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse))
+		if deepintshieldErr != nil {
+			return nil, providerUtils.EnrichError(ctx, deepintshieldErr, jsonData, responseBody, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		}
+		response = anthropicResponse.ToDeepIntShieldResponsesResponse(ctx)
+	} else {
+		rawRequest, rawResponse, deepintshieldErr = providerUtils.HandleProviderResponse(responseBody, response, jsonData, providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest), providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse))
+		if deepintshieldErr != nil {
+			return nil, providerUtils.EnrichError(ctx, deepintshieldErr, jsonData, responseBody, provider.sendBackRawRequest, provider.sendBackRawResponse)
+		}
+	}
+
+	response.ExtraFields.Provider = provider.GetProviderKey()
+	response.ExtraFields.ModelRequested = request.Model
+	response.ExtraFields.ModelDeployment = deployment
+	response.ExtraFields.Latency = latency.Milliseconds()
+	response.ExtraFields.ProviderResponseHeaders = providerResponseHeaders
+	response.ExtraFields.RequestType = schemas.ResponsesRequest
+
+	// Set raw request if enabled
+	if providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest) {
+		response.ExtraFields.RawRequest = rawRequest
+	}
+
+	// Set raw response if enabled
+	if providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse) {
+		response.ExtraFields.RawResponse = rawResponse
+	}
+
+	return response, nil
+}
+
+// ResponsesStream performs a streaming responses request to Azure's API.
+func (provider *AzureProvider) ResponsesStream(ctx *schemas.DeepIntShieldContext, postHookRunner schemas.PostHookRunner, key schemas.Key, request *schemas.DeepIntShieldResponsesRequest) (chan *schemas.DeepIntShieldStreamChunk, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment, err := provider.getModelDeployment(key, request.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	postResponseConverter := func(response *schemas.DeepIntShieldResponsesStreamResponse) *schemas.DeepIntShieldResponsesStreamResponse {
+		response.ExtraFields.ModelDeployment = deployment
+		return response
+	}
+
+	var url string
+	if schemas.IsAnthropicModel(deployment) {
+		authHeader, err := provider.getAzureAuthHeaders(ctx, key, true)
+		if err != nil {
+			return nil, err
+		}
+		authHeader["anthropic-version"] = AzureAnthropicAPIVersionDefault
+		url = fmt.Sprintf("%s/anthropic/v1/messages", key.AzureKeyConfig.Endpoint.GetValue())
+
+		jsonData, deepintshieldErr := getRequestBodyForAnthropicResponses(ctx, request, deployment, provider.GetProviderKey(), true)
+		if deepintshieldErr != nil {
+			return nil, deepintshieldErr
+		}
+
+		// Use shared streaming logic from Anthropic
+		return anthropic.HandleAnthropicResponsesStream(
+			ctx,
+			provider.client,
+			url,
+			jsonData,
+			authHeader,
+			provider.networkConfig.ExtraHeaders,
+			providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+			provider.GetProviderKey(),
+			postHookRunner,
+			postResponseConverter,
+			provider.logger,
+			&providerUtils.RequestMetadata{
+				Provider:    provider.GetProviderKey(),
+				Model:       request.Model,
+				RequestType: schemas.ResponsesStreamRequest,
+			},
+		)
+	} else {
+		authHeader, err := provider.getAzureAuthHeaders(ctx, key, false)
+		if err != nil {
+			return nil, err
+		}
+		url = fmt.Sprintf("%s/openai/v1/responses?api-version=preview", key.AzureKeyConfig.Endpoint.GetValue())
+
+		postRequestConverter := func(req *openai.OpenAIResponsesRequest) *openai.OpenAIResponsesRequest {
+			req.Model = deployment
+			return req
+		}
+
+		// Use shared streaming logic from OpenAI
+		return openai.HandleOpenAIResponsesStreaming(
+			ctx,
+			provider.client,
+			url,
+			request,
+			authHeader,
+			provider.networkConfig.ExtraHeaders,
+			providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+			provider.GetProviderKey(),
+			postHookRunner,
+			nil,
+			nil,
+			postRequestConverter,
+			postResponseConverter,
+			provider.logger,
+		)
+	}
+}
+
+// Embedding generates embeddings for the given input text(s) using Azure.
+// The input can be either a single string or a slice of strings for batch embedding.
+// Returns a DeepIntShieldResponse containing the embedding(s) and any error that occurred.
+func (provider *AzureProvider) Embedding(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldEmbeddingRequest) (*schemas.DeepIntShieldEmbeddingResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment, err := provider.getModelDeployment(key, request.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	// Use centralized converter
+	jsonData, deepintshieldErr := providerUtils.CheckContextAndGetRequestBody(
+		ctx,
+		request,
+		func() (providerUtils.RequestBodyWithExtraParams, error) {
+			return openai.ToOpenAIEmbeddingRequest(request), nil
+		},
+		provider.GetProviderKey())
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	responseBody, deployment, latency, providerResponseHeaders, err := provider.completeRequest(
+		ctx,
+		jsonData,
+		fmt.Sprintf("openai/deployments/%s/embeddings", deployment),
+		key,
+		deployment,
+		request.Model,
+		schemas.EmbeddingRequest,
+	)
+	if providerResponseHeaders != nil {
+		ctx.SetValue(schemas.DeepIntShieldContextKeyProviderResponseHeaders, providerResponseHeaders)
+	}
+	if err != nil {
+		return nil, providerUtils.EnrichError(ctx, err, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	// Large response mode: return lightweight response with metadata only
+	if isLargeResp, _ := ctx.Value(schemas.DeepIntShieldContextKeyLargeResponseMode).(bool); isLargeResp {
+		return &schemas.DeepIntShieldEmbeddingResponse{
+			Model: request.Model,
+			ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+				Provider:                provider.GetProviderKey(),
+				ModelRequested:          request.Model,
+				ModelDeployment:         deployment,
+				RequestType:             schemas.EmbeddingRequest,
+				Latency:                 latency.Milliseconds(),
+				ProviderResponseHeaders: providerResponseHeaders,
+			},
+		}, nil
+	}
+
+	response := &schemas.DeepIntShieldEmbeddingResponse{}
+
+	// Use enhanced response handler with pre-allocated response
+	rawRequest, rawResponse, deepintshieldErr := providerUtils.HandleProviderResponse(responseBody, response, jsonData, providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest), providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse))
+	if deepintshieldErr != nil {
+		return nil, providerUtils.EnrichError(ctx, deepintshieldErr, jsonData, responseBody, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	response.ExtraFields.Provider = provider.GetProviderKey()
+	response.ExtraFields.Latency = latency.Milliseconds()
+	response.ExtraFields.ProviderResponseHeaders = providerResponseHeaders
+	response.ExtraFields.ModelRequested = request.Model
+	response.ExtraFields.ModelDeployment = deployment
+	response.ExtraFields.RequestType = schemas.EmbeddingRequest
+
+	// Set raw request if enabled
+	if providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest) {
+		response.ExtraFields.RawRequest = rawRequest
+	}
+
+	// Set raw response if enabled
+	if providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse) {
+		response.ExtraFields.RawResponse = rawResponse
+	}
+
+	return response, nil
+}
+
+// Speech is not supported by the Azure provider.
+func (provider *AzureProvider) Speech(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldSpeechRequest) (*schemas.DeepIntShieldSpeechResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment, err := provider.getModelDeployment(key, request.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+	}
+
+	endpoint := key.AzureKeyConfig.Endpoint.GetValue()
+	if endpoint == "" {
+		return nil, providerUtils.NewConfigurationError("endpoint not set", provider.GetProviderKey())
+	}
+
+	url := fmt.Sprintf("%s/openai/deployments/%s/audio/speech?api-version=%s", endpoint, deployment, apiVersion.GetValue())
+
+	response, err := openai.HandleOpenAISpeechRequest(
+		ctx,
+		provider.client,
+		url,
+		request,
+		key,
+		provider.networkConfig.ExtraHeaders,
+		provider.GetProviderKey(),
+		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		nil,
+		provider.logger,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	response.ExtraFields.ModelRequested = request.Model
+	response.ExtraFields.ModelDeployment = deployment
+
+	return response, err
+}
+
+// Rerank is not supported by the Azure provider.
+func (provider *AzureProvider) Rerank(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldRerankRequest) (*schemas.DeepIntShieldRerankResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.RerankRequest, provider.GetProviderKey())
+}
+
+// SpeechStream handles streaming for speech synthesis with Azure.
+// Azure sends raw binary audio bytes in SSE format, unlike OpenAI which sends JSON.
+func (provider *AzureProvider) SpeechStream(ctx *schemas.DeepIntShieldContext, postHookRunner schemas.PostHookRunner, key schemas.Key, request *schemas.DeepIntShieldSpeechRequest) (chan *schemas.DeepIntShieldStreamChunk, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment, err := provider.getModelDeployment(key, request.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get Azure authentication headers
+	authHeader, err := provider.getAzureAuthHeaders(ctx, key, false)
+	if err != nil {
+		return nil, err
+	}
+
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+	}
+	url := fmt.Sprintf("%s/openai/deployments/%s/audio/speech?api-version=%s", key.AzureKeyConfig.Endpoint.GetValue(), deployment, apiVersion.GetValue())
+
+	// Create HTTP request for streaming
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	resp.StreamBody = true
+	defer fasthttp.ReleaseRequest(req)
+
+	// Prepare headers
+	headers := map[string]string{
+		"Content-Type":    "application/json",
+		"Accept":          "text/event-stream",
+		"Cache-Control":   "no-cache",
+		"Accept-Encoding": "identity",
+	}
+
+	maps.Copy(headers, authHeader)
+
+	req.Header.SetMethod(http.MethodPost)
+	req.SetRequestURI(url)
+	req.Header.SetContentType("application/json")
+
+	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+
+	// Set headers
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
+	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
+
+	// Build request body
+	jsonBody, deepintshieldErr := providerUtils.CheckContextAndGetRequestBody(
+		ctx,
+		request,
+		func() (providerUtils.RequestBodyWithExtraParams, error) {
+			reqBody := openai.ToOpenAISpeechRequest(request)
+			if reqBody != nil {
+				reqBody.StreamFormat = schemas.Ptr("sse")
+				reqBody.Model = deployment // Replace model with deployment
+			}
+			return reqBody, nil
+		},
+		provider.GetProviderKey())
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	if !providerUtils.ApplyLargePayloadRequestBodyWithModelNormalization(ctx, req, schemas.OpenAI) {
+		req.SetBody(jsonBody)
+	}
+
+	// Make the request
+	requestErr := providerUtils.ClientFromContext(ctx, provider.client).Do(req, resp)
+	if requestErr != nil {
+		defer providerUtils.ReleaseStreamingResponse(resp)
+		if errors.Is(requestErr, context.Canceled) {
+			return nil, providerUtils.EnrichError(ctx, &schemas.DeepIntShieldError{
+				IsDeepIntShieldError: false,
+				Error: &schemas.ErrorField{
+					Type:    schemas.Ptr(schemas.RequestCancelled),
+					Message: schemas.ErrRequestCancelled,
+					Error:   requestErr,
+				},
+			}, jsonBody, nil, sendBackRawRequest, sendBackRawResponse)
+		}
+		if errors.Is(requestErr, fasthttp.ErrTimeout) || errors.Is(requestErr, context.DeadlineExceeded) {
+			return nil, providerUtils.EnrichError(ctx, providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderRequestTimedOut, requestErr, provider.GetProviderKey()), jsonBody, nil, sendBackRawRequest, sendBackRawResponse)
+		}
+		return nil, providerUtils.EnrichError(ctx, providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderDoRequest, requestErr, provider.GetProviderKey()), jsonBody, nil, sendBackRawRequest, sendBackRawResponse)
+	}
+
+	// Extract provider response headers before status check so error responses also forward them
+	ctx.SetValue(schemas.DeepIntShieldContextKeyProviderResponseHeaders, providerUtils.ExtractProviderResponseHeaders(resp))
+
+	// Check for HTTP errors
+	if resp.StatusCode() != fasthttp.StatusOK {
+		defer providerUtils.ReleaseStreamingResponse(resp)
+		return nil, providerUtils.EnrichError(ctx, openai.ParseOpenAIError(resp, schemas.SpeechStreamRequest, provider.GetProviderKey(), request.Model), jsonBody, nil, sendBackRawRequest, sendBackRawResponse)
+	}
+
+	// Create response channel
+	responseChan := make(chan *schemas.DeepIntShieldStreamChunk, schemas.DefaultStreamBufferSize)
+
+	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, provider.networkConfig.StreamIdleTimeoutInSeconds)
+
+	// Start streaming in a goroutine
+	go func() {
+		defer func() {
+			if ctx.Err() == context.Canceled {
+				providerUtils.HandleStreamCancellation(ctx, postHookRunner, responseChan, provider.GetProviderKey(), request.Model, schemas.SpeechStreamRequest, provider.logger)
+			} else if ctx.Err() == context.DeadlineExceeded {
+				providerUtils.HandleStreamTimeout(ctx, postHookRunner, responseChan, provider.GetProviderKey(), request.Model, schemas.SpeechStreamRequest, provider.logger)
+			}
+			close(responseChan)
+		}()
+		// Always release response on exit; bodyStream close should prevent indefinite blocking.
+		defer providerUtils.ReleaseStreamingResponse(resp)
+
+		reader, releaseGzip := providerUtils.DecompressStreamBody(resp)
+		defer releaseGzip()
+
+		// Wrap reader with idle timeout to detect stalled streams (e.g., Azure TPM throttling
+		// that stops sending data but keeps the TCP connection open).
+		reader, stopIdleTimeout := providerUtils.NewIdleTimeoutReader(reader, resp.BodyStream(), providerUtils.GetStreamIdleTimeout(ctx))
+		defer stopIdleTimeout()
+
+		// Setup cancellation handler to close the raw network stream on ctx cancellation,
+		// which immediately unblocks any in-progress read (including reads blocked inside a gzip decompression layer).
+		stopCancellation := providerUtils.SetupStreamCancellation(ctx, resp.BodyStream(), provider.logger)
+		defer stopCancellation()
+
+		chunkIndex := -1
+		startTime := time.Now()
+		lastChunkTime := startTime
+
+		// Read SSE events manually to handle binary data with embedded newlines
+		// SSE format: "data: <content>\n\n" - events are separated by double newlines
+		// We can't use bufio.Scanner because MP3 data contains 0x0a bytes which get interpreted as newlines
+		readBuffer := make([]byte, 64*1024) // 64KB read chunks
+		var accumulated []byte
+		doneReceived := false
+
+		for {
+			// If context was cancelled/timed out, let defer handle it
+			if ctx.Err() != nil {
+				return
+			}
+			// Read from stream
+			n, readErr := reader.Read(readBuffer)
+			if n > 0 {
+				accumulated = append(accumulated, readBuffer[:n]...)
+
+				// Process complete SSE events (separated by \r\n\r\n or \n\n)
+				for {
+					// Find the next double-newline separator (try CRLF first, then LF)
+					var idx int
+					var separatorLen int
+					idx = bytes.Index(accumulated, []byte("\r\n\r\n"))
+					if idx != -1 {
+						separatorLen = 4 // \r\n\r\n
+					} else {
+						idx = bytes.Index(accumulated, []byte("\n\n"))
+						if idx != -1 {
+							separatorLen = 2 // \n\n
+						}
+					}
+					if idx == -1 {
+						// No complete event yet, need more data
+						break
+					}
+
+					// Extract the event (everything up to the separator)
+					event := accumulated[:idx]
+					accumulated = accumulated[idx+separatorLen:] // Skip the separator
+
+					// Skip empty events and comments
+					if len(event) == 0 || bytes.HasPrefix(event, []byte(":")) {
+						continue
+					}
+
+					// Parse the SSE event
+					var audioData []byte
+
+					// Check if this has "data: " prefix (standard SSE format)
+					if bytes.HasPrefix(event, []byte("data: ")) {
+						audioData = event[6:] // Skip "data: " prefix
+						// Check for [DONE] marker - break out of loops to send final response
+						if bytes.Equal(audioData, []byte("[DONE]")) {
+							doneReceived = true
+							break
+						}
+					} else {
+						// Raw data without prefix (shouldn't happen with Azure, but handle it)
+						audioData = event
+					}
+
+					// Skip empty data
+					if len(audioData) == 0 {
+						continue
+					}
+
+					// Azure sends JSON-wrapped responses for speech streaming
+					// Parse the JSON to extract the response type and audio data
+					var response schemas.DeepIntShieldSpeechStreamResponse
+					if err := sonic.Unmarshal(audioData, &response); err != nil {
+						// If JSON parsing fails, check if this might be an error response
+						// Quick check for error field (allocation-free using sonic.Get)
+						if errorNode, _ := sonic.Get(audioData, "error"); errorNode.Exists() {
+							// Only unmarshal when we know there's an error
+							var deepintshieldErr schemas.DeepIntShieldError
+							if errParseErr := sonic.Unmarshal(audioData, &deepintshieldErr); errParseErr == nil {
+								if deepintshieldErr.Error != nil && deepintshieldErr.Error.Message != "" {
+									deepintshieldErr.ExtraFields = schemas.DeepIntShieldErrorExtraFields{
+										Provider:       provider.GetProviderKey(),
+										ModelRequested: request.Model,
+										RequestType:    schemas.SpeechStreamRequest,
+									}
+									ctx.SetValue(schemas.DeepIntShieldContextKeyStreamEndIndicator, true)
+									providerUtils.ProcessAndSendDeepIntShieldError(ctx, postHookRunner, &deepintshieldErr, responseChan, provider.logger)
+									return
+								}
+							}
+						}
+						// If it's not valid JSON, log and skip
+						provider.logger.Warn("failed to parse speech stream response: %v", err)
+						continue
+					}
+
+					// Check for completion event - skip if no audio data
+					if response.Type == schemas.SpeechStreamResponseTypeDone || len(response.Audio) == 0 {
+						// This is a control event or empty response - skip
+						continue
+					}
+
+					chunkIndex++
+
+					// Set extra fields for the response
+					response.ExtraFields = schemas.DeepIntShieldResponseExtraFields{
+						RequestType:     schemas.SpeechStreamRequest,
+						Provider:        provider.GetProviderKey(),
+						ModelRequested:  request.Model,
+						ModelDeployment: deployment,
+						ChunkIndex:      chunkIndex,
+						Latency:         time.Since(lastChunkTime).Milliseconds(),
+					}
+					lastChunkTime = time.Now()
+
+					if sendBackRawResponse {
+						response.ExtraFields.RawResponse = audioData
+					}
+
+					providerUtils.ProcessAndSendResponse(ctx, postHookRunner, providerUtils.GetDeepIntShieldResponseForStreamResponse(nil, nil, nil, &response, nil, nil), responseChan)
+				}
+
+				// Check if we received [DONE] marker - break outer loop to send final response
+				if doneReceived {
+					break
+				}
+			}
+
+			// Handle read errors
+			if readErr != nil {
+				// If context was cancelled/timed out, let defer handle it
+				if ctx.Err() != nil {
+					return
+				}
+				if readErr != io.EOF {
+					// Non-EOF errors (e.g., connection reset by peer due to TPM throttling)
+					// must be reported to the client instead of falling through to send
+					// a fake "done" response with truncated audio.
+					ctx.SetValue(schemas.DeepIntShieldContextKeyStreamEndIndicator, true)
+					provider.logger.Warn("Error reading stream: %v", readErr)
+					providerUtils.ProcessAndSendError(ctx, postHookRunner, readErr, responseChan, schemas.SpeechStreamRequest, provider.GetProviderKey(), request.Model, provider.logger)
+					return
+				}
+				break
+			}
+		}
+
+		// Send final "done" response only if we received the [DONE] marker from the provider.
+		// Without [DONE], the stream ended abnormally (e.g., clean EOF without proper SSE termination).
+		if chunkIndex >= 0 && doneReceived {
+			finalResponse := schemas.DeepIntShieldSpeechStreamResponse{
+				Type: schemas.SpeechStreamResponseTypeDone,
+				ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+					RequestType:     schemas.SpeechStreamRequest,
+					Provider:        provider.GetProviderKey(),
+					ModelRequested:  request.Model,
+					ModelDeployment: deployment,
+					ChunkIndex:      chunkIndex + 1,
+					Latency:         time.Since(startTime).Milliseconds(),
+				},
+			}
+
+			if sendBackRawRequest {
+				providerUtils.ParseAndSetRawRequest(&finalResponse.ExtraFields, jsonBody)
+			}
+
+			finalResponse.BackfillParams(request)
+			ctx.SetValue(schemas.DeepIntShieldContextKeyStreamEndIndicator, true)
+			providerUtils.ProcessAndSendResponse(ctx, postHookRunner, providerUtils.GetDeepIntShieldResponseForStreamResponse(nil, nil, nil, &finalResponse, nil, nil), responseChan)
+		} else if chunkIndex >= 0 && !doneReceived {
+			provider.logger.Warn("Stream ended without receiving [DONE] marker after %d chunks", chunkIndex+1)
+		}
+
+		// Response is released via deferred ReleaseStreamingResponse(resp) above.
+	}()
+
+	return responseChan, nil
+}
+
+// Transcription is not supported by the Azure provider.
+func (provider *AzureProvider) Transcription(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldTranscriptionRequest) (*schemas.DeepIntShieldTranscriptionResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment, err := provider.getModelDeployment(key, request.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+	}
+
+	url := fmt.Sprintf("%s/openai/deployments/%s/audio/transcriptions?api-version=%s", key.AzureKeyConfig.Endpoint.GetValue(), deployment, apiVersion.GetValue())
+
+	response, err := openai.HandleOpenAITranscriptionRequest(
+		ctx,
+		provider.client,
+		url,
+		request,
+		key,
+		provider.networkConfig.ExtraHeaders,
+		provider.GetProviderKey(),
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		nil,
+		provider.logger,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	response.ExtraFields.ModelRequested = request.Model
+	response.ExtraFields.ModelDeployment = deployment
+
+	return response, err
+}
+
+// TranscriptionStream is not supported by the Azure provider.
+func (provider *AzureProvider) TranscriptionStream(ctx *schemas.DeepIntShieldContext, postHookRunner schemas.PostHookRunner, key schemas.Key, request *schemas.DeepIntShieldTranscriptionRequest) (chan *schemas.DeepIntShieldStreamChunk, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.TranscriptionStreamRequest, provider.GetProviderKey())
+}
+
+// ImageGeneration performs an Image Generation request to Azure's API.
+// It formats the request, sends it to Azure, and processes the response.
+// Returns a DeepIntShieldResponse containing the deepintshield response or an error if the request fails.
+func (provider *AzureProvider) ImageGeneration(ctx *schemas.DeepIntShieldContext, key schemas.Key,
+	request *schemas.DeepIntShieldImageGenerationRequest) (*schemas.DeepIntShieldImageGenerationResponse, *schemas.DeepIntShieldError) {
+	// Validate api key configs
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment := key.AzureKeyConfig.Deployments[request.Model]
+	if deployment == "" {
+		return nil, providerUtils.NewConfigurationError(fmt.Sprintf("deployment not found for model %s", request.Model), provider.GetProviderKey())
+	}
+
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil || apiVersion.GetValue() == "" {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+	}
+
+	endpoint := key.AzureKeyConfig.Endpoint.GetValue()
+	if endpoint == "" {
+		return nil, providerUtils.NewConfigurationError("endpoint not set", provider.GetProviderKey())
+	}
+
+	response, err := openai.HandleOpenAIImageGenerationRequest(
+		ctx,
+		provider.client,
+		fmt.Sprintf("%s/openai/deployments/%s/images/generations?api-version=%s", endpoint, deployment, apiVersion.GetValue()),
+		request,
+		key,
+		provider.networkConfig.ExtraHeaders,
+		provider.GetProviderKey(),
+		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		provider.logger,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	response.ExtraFields.ModelRequested = request.Model
+	response.ExtraFields.ModelDeployment = deployment
+
+	return response, err
+}
+
+// ImageGenerationStream performs a streaming image generation request to Azure's API.
+// It formats the request, sends it to Azure, and processes the response.
+// Returns a channel of DeepIntShieldStreamChunk objects or an error if the request fails.
+func (provider *AzureProvider) ImageGenerationStream(
+	ctx *schemas.DeepIntShieldContext,
+	postHookRunner schemas.PostHookRunner,
+	key schemas.Key,
+	request *schemas.DeepIntShieldImageGenerationRequest,
+) (chan *schemas.DeepIntShieldStreamChunk, *schemas.DeepIntShieldError) {
+
+	// Validate api key configs
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	//
+	deployment := key.AzureKeyConfig.Deployments[request.Model]
+	if deployment == "" {
+		return nil, providerUtils.NewConfigurationError(fmt.Sprintf("deployment not found for model %s", request.Model), provider.GetProviderKey())
+	}
+
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil || apiVersion.GetValue() == "" {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+	}
+
+	endpoint := key.AzureKeyConfig.Endpoint.GetValue()
+	if endpoint == "" {
+		return nil, providerUtils.NewConfigurationError("endpoint not set", provider.GetProviderKey())
+	}
+
+	postResponseConverter := func(resp *schemas.DeepIntShieldImageGenerationStreamResponse) *schemas.DeepIntShieldImageGenerationStreamResponse {
+		if resp != nil {
+			resp.ExtraFields.ModelDeployment = deployment
+		}
+		return resp
+	}
+
+	url := fmt.Sprintf("%s/openai/deployments/%s/images/generations?api-version=%s", endpoint, deployment, apiVersion.GetValue())
+
+	authHeader, err := provider.getAzureAuthHeaders(ctx, key, false)
+	if err != nil {
+		return nil, err
+	}
+
+	// Azure is OpenAI-compatible
+	return openai.HandleOpenAIImageGenerationStreaming(
+		ctx,
+		provider.client,
+		url,
+		request,
+		authHeader,
+		provider.networkConfig.ExtraHeaders,
+		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		provider.GetProviderKey(),
+		postHookRunner,
+		nil,
+		nil,
+		postResponseConverter,
+		provider.logger,
+	)
+
+}
+
+// ImageEdit performs an image edit request to Azure's API.
+func (provider *AzureProvider) ImageEdit(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldImageEditRequest) (*schemas.DeepIntShieldImageGenerationResponse, *schemas.DeepIntShieldError) {
+	// Validate api key configs
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment := key.AzureKeyConfig.Deployments[request.Model]
+	if deployment == "" {
+		return nil, providerUtils.NewConfigurationError(fmt.Sprintf("deployment not found for model %s", request.Model), provider.GetProviderKey())
+	}
+
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil || apiVersion.GetValue() == "" {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionImageEditDefault)
+	}
+
+	endpoint := key.AzureKeyConfig.Endpoint.GetValue()
+	if endpoint == "" {
+		return nil, providerUtils.NewConfigurationError("endpoint not set", provider.GetProviderKey())
+	}
+
+	url := fmt.Sprintf("%s/openai/deployments/%s/images/edits?api-version=%s", endpoint, deployment, apiVersion.GetValue())
+	response, err := openai.HandleOpenAIImageEditRequest(
+		ctx,
+		provider.client,
+		url,
+		request,
+		key,
+		provider.networkConfig.ExtraHeaders,
+		false,
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		provider.GetProviderKey(),
+		provider.logger,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	response.ExtraFields.ModelRequested = request.Model
+	response.ExtraFields.ModelDeployment = deployment
+
+	return response, err
+}
+
+// ImageEditStream performs a streaming image edit request to Azure's API.
+func (provider *AzureProvider) ImageEditStream(ctx *schemas.DeepIntShieldContext, postHookRunner schemas.PostHookRunner, key schemas.Key, request *schemas.DeepIntShieldImageEditRequest) (chan *schemas.DeepIntShieldStreamChunk, *schemas.DeepIntShieldError) {
+	// Validate api key configs
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment := key.AzureKeyConfig.Deployments[request.Model]
+	if deployment == "" {
+		return nil, providerUtils.NewConfigurationError(fmt.Sprintf("deployment not found for model %s", request.Model), provider.GetProviderKey())
+	}
+
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil || apiVersion.GetValue() == "" {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionImageEditDefault)
+	}
+
+	endpoint := key.AzureKeyConfig.Endpoint.GetValue()
+	if endpoint == "" {
+		return nil, providerUtils.NewConfigurationError("endpoint not set", provider.GetProviderKey())
+	}
+
+	postResponseConverter := func(resp *schemas.DeepIntShieldImageGenerationStreamResponse) *schemas.DeepIntShieldImageGenerationStreamResponse {
+		if resp != nil {
+			resp.ExtraFields.ModelDeployment = deployment
+		}
+		return resp
+	}
+
+	url := fmt.Sprintf("%s/openai/deployments/%s/images/edits?api-version=%s", endpoint, deployment, apiVersion.GetValue())
+
+	authHeader, err := provider.getAzureAuthHeaders(ctx, key, false)
+	if err != nil {
+		return nil, err
+	}
+
+	// Azure is OpenAI-compatible
+	return openai.HandleOpenAIImageEditStreamRequest(
+		ctx,
+		provider.client,
+		url,
+		request,
+		authHeader,
+		provider.networkConfig.ExtraHeaders,
+		false,
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		provider.GetProviderKey(),
+		postHookRunner,
+		nil,
+		nil,
+		postResponseConverter,
+		provider.logger,
+	)
+
+}
+
+// ImageVariation is not supported by the Azure provider.
+func (provider *AzureProvider) ImageVariation(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldImageVariationRequest) (*schemas.DeepIntShieldImageGenerationResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ImageVariationRequest, provider.GetProviderKey())
+}
+
+// VideoGeneration creates a video using Azure's OpenAI-compatible Sora API.
+// This delegates to the OpenAI handler with Azure-specific URL and authentication.
+func (provider *AzureProvider) VideoGeneration(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldVideoGenerationRequest) (*schemas.DeepIntShieldVideoGenerationResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	deployment, deepintshieldErr := provider.getModelDeployment(key, request.Model)
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	endpoint := key.AzureKeyConfig.Endpoint.GetValue()
+	if endpoint == "" {
+		return nil, providerUtils.NewConfigurationError("endpoint not set", provider.GetProviderKey())
+	}
+
+	// Build Azure URL for OpenAI-compatible video generation endpoint
+	url := fmt.Sprintf("%s/openai/v1/videos", endpoint)
+
+	requestCopy := *request
+	requestCopy.Model = deployment
+	response, deepintshieldErr := openai.HandleOpenAIVideoGenerationRequest(
+		ctx,
+		provider.client,
+		url,
+		&requestCopy,
+		key,
+		provider.networkConfig.ExtraHeaders,
+		provider.GetProviderKey(),
+		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		provider.logger,
+	)
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	response.ExtraFields.ModelRequested = request.Model
+	response.ExtraFields.ModelDeployment = deployment
+
+	return response, nil
+}
+
+// VideoRetrieve retrieves the status of a video from Azure's OpenAI-compatible API.
+func (provider *AzureProvider) VideoRetrieve(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldVideoRetrieveRequest) (*schemas.DeepIntShieldVideoGenerationResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	providerName := provider.GetProviderKey()
+	if request.ID == "" {
+		return nil, providerUtils.NewDeepIntShieldOperationError("video_id is required", nil, providerName)
+	}
+	videoID := providerUtils.StripVideoIDProviderSuffix(request.ID, providerName)
+
+	endpoint := key.AzureKeyConfig.Endpoint.GetValue()
+	if endpoint == "" {
+		return nil, providerUtils.NewConfigurationError("endpoint not set", providerName)
+	}
+
+	authHeaders, deepintshieldErr := provider.getAzureAuthHeaders(ctx, key, false)
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	return openai.HandleOpenAIVideoRetrieveRequest(
+		ctx,
+		provider.client,
+		fmt.Sprintf("%s/openai/v1/videos/%s", endpoint, videoID),
+		request,
+		key,
+		provider.networkConfig.ExtraHeaders,
+		authHeaders,
+		providerName,
+		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		provider.VideoDownload,
+		provider.logger,
+	)
+}
+
+// VideoDownload downloads video content from Azure's OpenAI-compatible API.
+func (provider *AzureProvider) VideoDownload(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldVideoDownloadRequest) (*schemas.DeepIntShieldVideoDownloadResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	providerName := provider.GetProviderKey()
+
+	if request.ID == "" {
+		return nil, providerUtils.NewDeepIntShieldOperationError("video_id is required", nil, providerName)
+	}
+	videoID := providerUtils.StripVideoIDProviderSuffix(request.ID, providerName)
+
+	endpoint := key.AzureKeyConfig.Endpoint.GetValue()
+	if endpoint == "" {
+		return nil, providerUtils.NewConfigurationError("endpoint not set", providerName)
+	}
+
+	// Create request
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	// Set headers
+	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+
+	// Build Azure URL
+	url := fmt.Sprintf("%s/openai/v1/videos/%s/content", endpoint, videoID)
+
+	req.SetRequestURI(url)
+	req.Header.SetMethod(http.MethodGet)
+
+	// Get authentication headers
+	authHeaders, deepintshieldErr := provider.getAzureAuthHeaders(ctx, key, false)
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+	for k, v := range authHeaders {
+		req.Header.Set(k, v)
+	}
+
+	// Make request
+	latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+	defer wait()
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	// Handle error response
+	if resp.StatusCode() != fasthttp.StatusOK {
+		provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
+		return nil, openai.ParseOpenAIError(resp, schemas.VideoDownloadRequest, providerName, "")
+	}
+
+	body, err := providerUtils.CheckAndDecodeBody(resp)
+	if err != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderResponseDecode, err, providerName)
+	}
+
+	// Get content type from response
+	contentType := string(resp.Header.ContentType())
+	if contentType == "" {
+		// Default to video/mp4 if not specified
+		contentType = "video/mp4"
+	}
+
+	// Create response
+	response := &schemas.DeepIntShieldVideoDownloadResponse{
+		VideoID:     request.ID,
+		Content:     append([]byte(nil), body...),
+		ContentType: contentType,
+		ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+			RequestType: schemas.VideoDownloadRequest,
+			Provider:    providerName,
+			Latency:     latency.Milliseconds(),
+		},
+	}
+
+	return response, nil
+}
+
+// VideoDelete deletes a video from Azure's OpenAI-compatible API.
+func (provider *AzureProvider) VideoDelete(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldVideoDeleteRequest) (*schemas.DeepIntShieldVideoDeleteResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	providerName := provider.GetProviderKey()
+
+	if request.ID == "" {
+		return nil, providerUtils.NewDeepIntShieldOperationError("video_id is required", nil, providerName)
+	}
+	videoID := providerUtils.StripVideoIDProviderSuffix(request.ID, providerName)
+
+	endpoint := key.AzureKeyConfig.Endpoint.GetValue()
+	if endpoint == "" {
+		return nil, providerUtils.NewConfigurationError("endpoint not set", providerName)
+	}
+
+	// Build Azure URL
+	url := fmt.Sprintf("%s/openai/v1/videos/%s", endpoint, videoID)
+
+	response, deepintshieldErr := openai.HandleOpenAIVideoDeleteRequest(
+		ctx,
+		provider.client,
+		url,
+		videoID,
+		key,
+		provider.networkConfig.ExtraHeaders,
+		providerName,
+		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		provider.logger,
+	)
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	return response, nil
+}
+
+// VideoList lists videos from Azure's OpenAI-compatible API.
+func (provider *AzureProvider) VideoList(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldVideoListRequest) (*schemas.DeepIntShieldVideoListResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfig(key); err != nil {
+		return nil, err
+	}
+
+	endpoint := key.AzureKeyConfig.Endpoint.GetValue()
+	if endpoint == "" {
+		return nil, providerUtils.NewConfigurationError("endpoint not set", provider.GetProviderKey())
+	}
+
+	// Build Azure URL
+	baseURL := fmt.Sprintf("%s/openai/v1/videos", endpoint)
+
+	response, deepintshieldErr := openai.HandleOpenAIVideoListRequest(
+		ctx,
+		provider.client,
+		baseURL,
+		request,
+		key,
+		provider.networkConfig.ExtraHeaders,
+		provider.GetProviderKey(),
+		providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
+		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
+		provider.logger,
+	)
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	return response, nil
+}
+
+// VideoRemix is not supported by Azure provider.
+func (provider *AzureProvider) VideoRemix(_ *schemas.DeepIntShieldContext, _ schemas.Key, _ *schemas.DeepIntShieldVideoRemixRequest) (*schemas.DeepIntShieldVideoGenerationResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.VideoRemixRequest, provider.GetProviderKey())
+}
+
+// validateKeyConfig validates the key configuration.
+// It checks if the key config is set, the endpoint is set, and the deployments are set.
+// Returns an error if any of the checks fail.
+func (provider *AzureProvider) validateKeyConfig(key schemas.Key) *schemas.DeepIntShieldError {
+	if key.AzureKeyConfig == nil {
+		return providerUtils.NewConfigurationError("azure key config not set", provider.GetProviderKey())
+	}
+
+	if key.AzureKeyConfig.Endpoint.GetValue() == "" {
+		return providerUtils.NewConfigurationError("endpoint not set", provider.GetProviderKey())
+	}
+
+	if key.AzureKeyConfig.Deployments == nil {
+		return providerUtils.NewConfigurationError("deployments not set", provider.GetProviderKey())
+	}
+
+	return nil
+}
+
+// validateKeyConfigForFiles validates key config for file/batch APIs, which only
+// require a configured Azure endpoint (no per-model deployments needed).
+func (provider *AzureProvider) validateKeyConfigForFiles(key schemas.Key) *schemas.DeepIntShieldError {
+	if key.AzureKeyConfig == nil {
+		return providerUtils.NewConfigurationError("azure key config not set", provider.GetProviderKey())
+	}
+	if key.AzureKeyConfig.Endpoint.GetValue() == "" {
+		return providerUtils.NewConfigurationError("endpoint not set", provider.GetProviderKey())
+	}
+	return nil
+}
+
+func (provider *AzureProvider) getModelDeployment(key schemas.Key, model string) (string, *schemas.DeepIntShieldError) {
+	if key.AzureKeyConfig == nil {
+		return "", providerUtils.NewConfigurationError("azure key config not set", provider.GetProviderKey())
+	}
+
+	if key.AzureKeyConfig.Deployments != nil {
+		if deployment, ok := key.AzureKeyConfig.Deployments[model]; ok {
+			return deployment, nil
+		}
+	}
+	return "", providerUtils.NewConfigurationError(fmt.Sprintf("deployment not found for model %s", model), provider.GetProviderKey())
+}
+
+// FileUpload uploads a file to Azure OpenAI.
+func (provider *AzureProvider) FileUpload(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldFileUploadRequest) (*schemas.DeepIntShieldFileUploadResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfigForFiles(key); err != nil {
+		return nil, err
+	}
+
+	providerName := provider.GetProviderKey()
+
+	if len(request.File) == 0 {
+		return nil, providerUtils.NewDeepIntShieldOperationError("file content is required", nil, providerName)
+	}
+
+	if request.Purpose == "" {
+		return nil, providerUtils.NewDeepIntShieldOperationError("purpose is required", nil, providerName)
+	}
+
+	// Get API version
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+	}
+
+	// Create multipart form data
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	// Add purpose field
+	if err := writer.WriteField("purpose", string(request.Purpose)); err != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError("failed to write purpose field", err, providerName)
+	}
+
+	// Add file field
+	filename := request.Filename
+	if filename == "" {
+		filename = "file.jsonl"
+	}
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError("failed to create form file", err, providerName)
+	}
+	if _, err := part.Write(request.File); err != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError("failed to write file content", err, providerName)
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError("failed to close multipart writer", err, providerName)
+	}
+
+	// Create request
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	// Build URL with query params
+	baseURL := fmt.Sprintf("%s/openai/files", key.AzureKeyConfig.Endpoint.GetValue())
+	values := url.Values{}
+	values.Set("api-version", apiVersion.GetValue())
+	requestURL := baseURL + "?" + values.Encode()
+
+	// Set headers
+	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+	req.SetRequestURI(requestURL)
+	req.Header.SetMethod(http.MethodPost)
+	req.Header.SetContentType(writer.FormDataContentType())
+
+	// Set Azure authentication
+	if err := provider.setAzureAuth(ctx, req, key); err != nil {
+		return nil, err
+	}
+
+	req.SetBody(buf.Bytes())
+
+	// Make request
+	latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+	defer wait()
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	// Handle error response
+	if resp.StatusCode() != fasthttp.StatusOK && resp.StatusCode() != fasthttp.StatusCreated {
+		provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
+		return nil, openai.ParseOpenAIError(resp, schemas.FileUploadRequest, providerName, "")
+	}
+
+	body, err := providerUtils.CheckAndDecodeBody(resp)
+	if err != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderResponseDecode, err, providerName)
+	}
+
+	var openAIResp openai.OpenAIFileResponse
+	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
+	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
+	rawRequest, rawResponse, deepintshieldErr := providerUtils.HandleProviderResponse(body, &openAIResp, nil, sendBackRawRequest, sendBackRawResponse)
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	return openAIResp.ToDeepIntShieldFileUploadResponse(providerName, latency, sendBackRawRequest, sendBackRawResponse, rawRequest, rawResponse), nil
+}
+
+// FileList lists files from all provided Azure keys and aggregates results.
+// FileList lists files using serial pagination across keys.
+// Exhausts all pages from one key before moving to the next.
+func (provider *AzureProvider) FileList(ctx *schemas.DeepIntShieldContext, keys []schemas.Key, request *schemas.DeepIntShieldFileListRequest) (*schemas.DeepIntShieldFileListResponse, *schemas.DeepIntShieldError) {
+	providerName := provider.GetProviderKey()
+
+	if len(keys) == 0 {
+		return nil, providerUtils.NewConfigurationError("no Azure keys available for file list operation", providerName)
+	}
+
+	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
+	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
+
+	// Initialize serial pagination helper
+	helper, err := providerUtils.NewSerialListHelper(keys, request.After, provider.logger)
+	if err != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError("invalid pagination cursor", err, providerName)
+	}
+
+	// Get current key to query
+	key, nativeCursor, ok := helper.GetCurrentKey()
+	if !ok {
+		// All keys exhausted
+		return &schemas.DeepIntShieldFileListResponse{
+			Object:  "list",
+			Data:    []schemas.FileObject{},
+			HasMore: false,
+			ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+				RequestType: schemas.FileListRequest,
+				Provider:    providerName,
+			},
+		}, nil
+	}
+
+	// Validate key config
+	if err := provider.validateKeyConfigForFiles(key); err != nil {
+		return nil, err
+	}
+
+	// Get API version
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+	}
+
+	// Create request
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	// Build URL with query params
+	requestURL := fmt.Sprintf("%s/openai/files", key.AzureKeyConfig.Endpoint.GetValue())
+	values := url.Values{}
+	values.Set("api-version", apiVersion.GetValue())
+	if request.Purpose != "" {
+		values.Set("purpose", string(request.Purpose))
+	}
+	// Use native cursor from serial helper
+	if nativeCursor != "" {
+		values.Set("after", nativeCursor)
+	}
+	if encodedValues := values.Encode(); encodedValues != "" {
+		requestURL += "?" + encodedValues
+	}
+
+	// Set headers
+	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+	req.SetRequestURI(requestURL)
+	req.Header.SetMethod(http.MethodGet)
+	req.Header.SetContentType("application/json")
+
+	// Set Azure authentication
+	if err := provider.setAzureAuth(ctx, req, key); err != nil {
+		return nil, err
+	}
+
+	// Make request
+	latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+	defer wait()
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	// Handle error response
+	if resp.StatusCode() != fasthttp.StatusOK {
+		provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
+		return nil, openai.ParseOpenAIError(resp, schemas.FileListRequest, providerName, "")
+	}
+
+	body, decodeErr := providerUtils.CheckAndDecodeBody(resp)
+	if decodeErr != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderResponseDecode, decodeErr, providerName)
+	}
+
+	var openAIResp openai.OpenAIFileListResponse
+	_, _, deepintshieldErr = providerUtils.HandleProviderResponse(body, &openAIResp, nil, sendBackRawRequest, sendBackRawResponse)
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	// Convert files to DeepIntShield format
+	files := make([]schemas.FileObject, 0, len(openAIResp.Data))
+	var lastFileID string
+	for _, file := range openAIResp.Data {
+		files = append(files, schemas.FileObject{
+			ID:            file.ID,
+			Object:        file.Object,
+			Bytes:         file.Bytes,
+			CreatedAt:     file.CreatedAt,
+			Filename:      file.Filename,
+			Purpose:       schemas.FilePurpose(file.Purpose),
+			Status:        openai.ToDeepIntShieldFileStatus(file.Status),
+			StatusDetails: file.StatusDetails,
+		})
+		lastFileID = file.ID
+	}
+
+	// Build cursor for next request
+	nextCursor, hasMore := helper.BuildNextCursor(openAIResp.HasMore, lastFileID)
+
+	// Convert to DeepIntShield response
+	deepintshieldResp := &schemas.DeepIntShieldFileListResponse{
+		Object:  "list",
+		Data:    files,
+		HasMore: hasMore,
+		ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+			RequestType: schemas.FileListRequest,
+			Provider:    providerName,
+			Latency:     latency.Milliseconds(),
+		},
+	}
+	if nextCursor != "" {
+		deepintshieldResp.After = &nextCursor
+	}
+
+	return deepintshieldResp, nil
+}
+
+// FileRetrieve retrieves file metadata from Azure OpenAI by trying each key until found.
+func (provider *AzureProvider) FileRetrieve(ctx *schemas.DeepIntShieldContext, keys []schemas.Key, request *schemas.DeepIntShieldFileRetrieveRequest) (*schemas.DeepIntShieldFileRetrieveResponse, *schemas.DeepIntShieldError) {
+	providerName := provider.GetProviderKey()
+
+	if request.FileID == "" {
+		return nil, providerUtils.NewDeepIntShieldOperationError("file_id is required", nil, providerName)
+	}
+
+	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
+	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
+
+	var lastErr *schemas.DeepIntShieldError
+	for _, key := range keys {
+		if err := provider.validateKeyConfigForFiles(key); err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Get API version
+		apiVersion := key.AzureKeyConfig.APIVersion
+		if apiVersion == nil {
+			apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+		}
+
+		// Create request
+		req := fasthttp.AcquireRequest()
+		resp := fasthttp.AcquireResponse()
+
+		// Build URL with query params
+		baseURL := fmt.Sprintf("%s/openai/files/%s", key.AzureKeyConfig.Endpoint.GetValue(), url.PathEscape(request.FileID))
+		values := url.Values{}
+		values.Set("api-version", apiVersion.GetValue())
+		requestURL := baseURL + "?" + values.Encode()
+
+		// Set headers
+		providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+		req.SetRequestURI(requestURL)
+		req.Header.SetMethod(http.MethodGet)
+		req.Header.SetContentType("application/json")
+
+		// Set Azure authentication
+		if authErr := provider.setAzureAuth(ctx, req, key); authErr != nil {
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = authErr
+			continue
+		}
+
+		// Make request
+		latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+		if deepintshieldErr != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = deepintshieldErr
+			continue
+		}
+
+		// Handle error response
+		if resp.StatusCode() != fasthttp.StatusOK {
+			provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
+			lastErr = openai.ParseOpenAIError(resp, schemas.FileRetrieveRequest, providerName, "")
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			continue
+		}
+
+		body, err := providerUtils.CheckAndDecodeBody(resp)
+		if err != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderResponseDecode, err, providerName)
+			continue
+		}
+
+		var openAIResp openai.OpenAIFileResponse
+		rawRequest, rawResponse, deepintshieldErr := providerUtils.HandleProviderResponse(body, &openAIResp, nil, sendBackRawRequest, sendBackRawResponse)
+		if deepintshieldErr != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = deepintshieldErr
+			continue
+		}
+
+		wait()
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(resp)
+
+		return openAIResp.ToDeepIntShieldFileRetrieveResponse(providerName, latency, sendBackRawRequest, sendBackRawResponse, rawRequest, rawResponse), nil
+	}
+
+	return nil, lastErr
+}
+
+// FileDelete deletes a file from Azure OpenAI by trying each key until successful.
+func (provider *AzureProvider) FileDelete(ctx *schemas.DeepIntShieldContext, keys []schemas.Key, request *schemas.DeepIntShieldFileDeleteRequest) (*schemas.DeepIntShieldFileDeleteResponse, *schemas.DeepIntShieldError) {
+	providerName := provider.GetProviderKey()
+
+	if request.FileID == "" {
+		return nil, providerUtils.NewDeepIntShieldOperationError("file_id is required", nil, providerName)
+	}
+
+	if len(keys) == 0 {
+		return nil, providerUtils.NewConfigurationError("no Azure keys available for file delete operation", providerName)
+	}
+
+	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
+	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
+
+	var lastErr *schemas.DeepIntShieldError
+	for _, key := range keys {
+		if err := provider.validateKeyConfigForFiles(key); err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Get API version
+		apiVersion := key.AzureKeyConfig.APIVersion
+		if apiVersion == nil {
+			apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+		}
+
+		// Create request
+		req := fasthttp.AcquireRequest()
+		resp := fasthttp.AcquireResponse()
+
+		// Build URL with query params
+		baseURL := fmt.Sprintf("%s/openai/files/%s", key.AzureKeyConfig.Endpoint.GetValue(), url.PathEscape(request.FileID))
+		values := url.Values{}
+		values.Set("api-version", apiVersion.GetValue())
+		requestURL := baseURL + "?" + values.Encode()
+
+		// Set headers
+		providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+		req.SetRequestURI(requestURL)
+		req.Header.SetMethod(http.MethodDelete)
+		req.Header.SetContentType("application/json")
+
+		// Set Azure authentication
+		if authErr := provider.setAzureAuth(ctx, req, key); authErr != nil {
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = authErr
+			continue
+		}
+
+		// Make request
+		latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+		if deepintshieldErr != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = deepintshieldErr
+			continue
+		}
+
+		// Handle error response
+		if resp.StatusCode() != fasthttp.StatusOK && resp.StatusCode() != fasthttp.StatusNoContent {
+			provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
+			lastErr = openai.ParseOpenAIError(resp, schemas.FileDeleteRequest, providerName, "")
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			continue
+		}
+
+		if resp.StatusCode() == fasthttp.StatusNoContent {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			return &schemas.DeepIntShieldFileDeleteResponse{
+				ID:      request.FileID,
+				Object:  "file",
+				Deleted: true,
+				ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+					RequestType: schemas.FileDeleteRequest,
+					Provider:    providerName,
+					Latency:     latency.Milliseconds(),
+				},
+			}, nil
+		}
+
+		body, err := providerUtils.CheckAndDecodeBody(resp)
+		if err != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderResponseDecode, err, providerName)
+			continue
+		}
+
+		var openAIResp openai.OpenAIFileDeleteResponse
+		rawRequest, rawResponse, deepintshieldErr := providerUtils.HandleProviderResponse(body, &openAIResp, nil, sendBackRawRequest, sendBackRawResponse)
+		if deepintshieldErr != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = deepintshieldErr
+			continue
+		}
+
+		wait()
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(resp)
+
+		result := &schemas.DeepIntShieldFileDeleteResponse{
+			ID:      openAIResp.ID,
+			Object:  openAIResp.Object,
+			Deleted: openAIResp.Deleted,
+			ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+				RequestType: schemas.FileDeleteRequest,
+				Provider:    providerName,
+				Latency:     latency.Milliseconds(),
+			},
+		}
+
+		if sendBackRawRequest {
+			result.ExtraFields.RawRequest = rawRequest
+		}
+
+		if sendBackRawResponse {
+			result.ExtraFields.RawResponse = rawResponse
+		}
+
+		return result, nil
+	}
+
+	return nil, lastErr
+}
+
+// FileContent downloads file content from Azure OpenAI by trying each key until found.
+func (provider *AzureProvider) FileContent(ctx *schemas.DeepIntShieldContext, keys []schemas.Key, request *schemas.DeepIntShieldFileContentRequest) (*schemas.DeepIntShieldFileContentResponse, *schemas.DeepIntShieldError) {
+	providerName := provider.GetProviderKey()
+
+	if request.FileID == "" {
+		return nil, providerUtils.NewDeepIntShieldOperationError("file_id is required", nil, providerName)
+	}
+
+	if len(keys) == 0 {
+		return nil, providerUtils.NewConfigurationError("no Azure keys available for file content operation", providerName)
+	}
+
+	var lastErr *schemas.DeepIntShieldError
+
+	for _, key := range keys {
+		if err := provider.validateKeyConfigForFiles(key); err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Get API version
+		apiVersion := key.AzureKeyConfig.APIVersion
+		if apiVersion == nil {
+			apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+		}
+
+		// Create request
+		req := fasthttp.AcquireRequest()
+		resp := fasthttp.AcquireResponse()
+
+		// Build URL with query params
+		baseURL := fmt.Sprintf("%s/openai/files/%s/content", key.AzureKeyConfig.Endpoint.GetValue(), url.PathEscape(request.FileID))
+		values := url.Values{}
+		values.Set("api-version", apiVersion.GetValue())
+		requestURL := baseURL + "?" + values.Encode()
+
+		// Set headers
+		providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+		req.SetRequestURI(requestURL)
+		req.Header.SetMethod(http.MethodGet)
+
+		// Set Azure authentication
+		if authErr := provider.setAzureAuth(ctx, req, key); authErr != nil {
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = authErr
+			continue
+		}
+
+		// Make request
+		latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+		if deepintshieldErr != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = deepintshieldErr
+			continue
+		}
+
+		// Handle error response
+		if resp.StatusCode() != fasthttp.StatusOK {
+			provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
+			lastErr = openai.ParseOpenAIError(resp, schemas.FileContentRequest, providerName, "")
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			continue
+		}
+
+		body, err := providerUtils.CheckAndDecodeBody(resp)
+		if err != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderResponseDecode, err, providerName)
+			continue
+		}
+
+		// Get content type from response
+		contentType := string(resp.Header.ContentType())
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		content := append([]byte(nil), body...)
+
+		wait()
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(resp)
+
+		return &schemas.DeepIntShieldFileContentResponse{
+			FileID:      request.FileID,
+			Content:     content,
+			ContentType: contentType,
+			ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+				RequestType: schemas.FileContentRequest,
+				Provider:    providerName,
+				Latency:     latency.Milliseconds(),
+			},
+		}, nil
+	}
+
+	return nil, lastErr
+}
+
+// BatchCreate creates a new batch job on Azure OpenAI.
+// Azure Batch API uses the same format as OpenAI but with Azure-specific URL patterns.
+func (provider *AzureProvider) BatchCreate(ctx *schemas.DeepIntShieldContext, key schemas.Key, request *schemas.DeepIntShieldBatchCreateRequest) (*schemas.DeepIntShieldBatchCreateResponse, *schemas.DeepIntShieldError) {
+	if err := provider.validateKeyConfigForFiles(key); err != nil {
+		return nil, err
+	}
+
+	providerName := provider.GetProviderKey()
+
+	inputFileID := request.InputFileID
+
+	// If no file_id provided but inline requests are available, upload them first
+	if inputFileID == "" && len(request.Requests) > 0 {
+		// Convert inline requests to JSONL format
+		jsonlData, err := openai.ConvertRequestsToJSONL(request.Requests)
+		if err != nil {
+			return nil, providerUtils.NewDeepIntShieldOperationError("failed to convert requests to JSONL", err, providerName)
+		}
+
+		// Upload the file with purpose "batch"
+		uploadResp, deepintshieldErr := provider.FileUpload(ctx, key, &schemas.DeepIntShieldFileUploadRequest{
+			Provider: schemas.Azure,
+			File:     jsonlData,
+			Filename: "batch_requests.jsonl",
+			Purpose:  "batch",
+		})
+		if deepintshieldErr != nil {
+			return nil, deepintshieldErr
+		}
+
+		inputFileID = uploadResp.ID
+	}
+
+	// Validate that we have a file ID (either provided or uploaded)
+	if inputFileID == "" {
+		return nil, providerUtils.NewDeepIntShieldOperationError("either input_file_id or requests array is required for Azure batch API", nil, providerName)
+	}
+
+	// Get API version
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+	}
+
+	// Create request
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	// Build URL with query params
+	baseURL := fmt.Sprintf("%s/openai/batches", key.AzureKeyConfig.Endpoint.GetValue())
+	values := url.Values{}
+	values.Set("api-version", apiVersion.GetValue())
+	requestURL := baseURL + "?" + values.Encode()
+
+	// Set headers
+	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+	req.SetRequestURI(requestURL)
+	req.Header.SetMethod(http.MethodPost)
+	req.Header.SetContentType("application/json")
+
+	// Set Azure authentication
+	if err := provider.setAzureAuth(ctx, req, key); err != nil {
+		return nil, err
+	}
+
+	// Build request body
+	openAIReq := &openai.OpenAIBatchRequest{
+		InputFileID:      inputFileID,
+		Endpoint:         string(request.Endpoint),
+		CompletionWindow: request.CompletionWindow,
+		Metadata:         request.Metadata,
+	}
+
+	// Set default completion window if not provided
+	if openAIReq.CompletionWindow == "" {
+		openAIReq.CompletionWindow = "24h"
+	}
+
+	jsonData, err := sonic.Marshal(openAIReq)
+	if err != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderRequestMarshal, err, providerName)
+	}
+	req.SetBody(jsonData)
+
+	// Make request
+	latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+	defer wait()
+	if deepintshieldErr != nil {
+		return nil, providerUtils.EnrichError(ctx, deepintshieldErr, jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	// Handle error response
+	if resp.StatusCode() != fasthttp.StatusOK && resp.StatusCode() != fasthttp.StatusCreated {
+		provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
+		return nil, openai.ParseOpenAIError(resp, schemas.BatchCreateRequest, providerName, "")
+	}
+
+	body, err := providerUtils.CheckAndDecodeBody(resp)
+	if err != nil {
+		return nil, providerUtils.EnrichError(ctx, providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderResponseDecode, err, providerName), jsonData, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	var openAIResp openai.OpenAIBatchResponse
+	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
+	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
+	rawRequest, rawResponse, deepintshieldErr := providerUtils.HandleProviderResponse(body, &openAIResp, jsonData, sendBackRawRequest, sendBackRawResponse)
+	if deepintshieldErr != nil {
+		return nil, providerUtils.EnrichError(ctx, deepintshieldErr, jsonData, body, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	return openAIResp.ToDeepIntShieldBatchCreateResponse(providerName, latency, sendBackRawRequest, sendBackRawResponse, rawRequest, rawResponse), nil
+}
+
+// BatchList lists batch jobs from all provided Azure keys and aggregates results.
+// BatchList lists batch jobs using serial pagination across keys.
+// Exhausts all pages from one key before moving to the next.
+func (provider *AzureProvider) BatchList(ctx *schemas.DeepIntShieldContext, keys []schemas.Key, request *schemas.DeepIntShieldBatchListRequest) (*schemas.DeepIntShieldBatchListResponse, *schemas.DeepIntShieldError) {
+	providerName := provider.GetProviderKey()
+	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
+	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
+
+	if len(keys) == 0 {
+		return nil, providerUtils.NewConfigurationError("no Azure keys available for batch list operation", providerName)
+	}
+
+	// Initialize serial pagination helper
+	helper, err := providerUtils.NewSerialListHelper(keys, request.After, provider.logger)
+	if err != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError("invalid pagination cursor", err, providerName)
+	}
+
+	// Get current key to query
+	key, nativeCursor, ok := helper.GetCurrentKey()
+	if !ok {
+		// All keys exhausted
+		return &schemas.DeepIntShieldBatchListResponse{
+			Object:  "list",
+			Data:    []schemas.DeepIntShieldBatchRetrieveResponse{},
+			HasMore: false,
+			ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+				RequestType: schemas.BatchListRequest,
+				Provider:    providerName,
+			},
+		}, nil
+	}
+
+	// Validate key config
+	if err := provider.validateKeyConfigForFiles(key); err != nil {
+		return nil, err
+	}
+
+	// Get API version
+	apiVersion := key.AzureKeyConfig.APIVersion
+	if apiVersion == nil {
+		apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+	}
+
+	// Create request
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	// Build URL with query params
+	baseURL := fmt.Sprintf("%s/openai/batches", key.AzureKeyConfig.Endpoint.GetValue())
+	values := url.Values{}
+	values.Set("api-version", apiVersion.GetValue())
+	if request.Limit > 0 {
+		values.Set("limit", fmt.Sprintf("%d", request.Limit))
+	}
+	// Use native cursor from serial helper
+	if nativeCursor != "" {
+		values.Set("after", nativeCursor)
+	}
+	requestURL := baseURL + "?" + values.Encode()
+
+	// Set headers
+	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+	req.SetRequestURI(requestURL)
+	req.Header.SetMethod(http.MethodGet)
+	req.Header.SetContentType("application/json")
+
+	// Set Azure authentication
+	if err := provider.setAzureAuth(ctx, req, key); err != nil {
+		return nil, err
+	}
+
+	// Make request
+	latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+	defer wait()
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	// Handle error response
+	if resp.StatusCode() != fasthttp.StatusOK {
+		provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
+		return nil, openai.ParseOpenAIError(resp, schemas.BatchListRequest, providerName, "")
+	}
+
+	body, decodeErr := providerUtils.CheckAndDecodeBody(resp)
+	if decodeErr != nil {
+		return nil, providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderResponseDecode, decodeErr, providerName)
+	}
+
+	var openAIResp openai.OpenAIBatchListResponse
+	rawRequest, rawResponse, deepintshieldErr := providerUtils.HandleProviderResponse(body, &openAIResp, nil, sendBackRawRequest, sendBackRawResponse)
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	// Convert batches to DeepIntShield format
+	batches := make([]schemas.DeepIntShieldBatchRetrieveResponse, 0, len(openAIResp.Data))
+	var lastBatchID string
+	for _, batch := range openAIResp.Data {
+		batches = append(batches, *batch.ToDeepIntShieldBatchRetrieveResponse(providerName, latency, sendBackRawRequest, sendBackRawResponse, rawRequest, rawResponse))
+		lastBatchID = batch.ID
+	}
+
+	// Build cursor for next request
+	nextCursor, hasMore := helper.BuildNextCursor(openAIResp.HasMore, lastBatchID)
+
+	// Convert to DeepIntShield response
+	deepintshieldResp := &schemas.DeepIntShieldBatchListResponse{
+		Object:  "list",
+		Data:    batches,
+		HasMore: hasMore,
+		ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+			RequestType: schemas.BatchListRequest,
+			Provider:    providerName,
+			Latency:     latency.Milliseconds(),
+		},
+	}
+	if nextCursor != "" {
+		deepintshieldResp.NextCursor = &nextCursor
+	}
+
+	return deepintshieldResp, nil
+}
+
+// BatchRetrieve retrieves a specific batch job from Azure OpenAI by trying each key until found.
+func (provider *AzureProvider) BatchRetrieve(ctx *schemas.DeepIntShieldContext, keys []schemas.Key, request *schemas.DeepIntShieldBatchRetrieveRequest) (*schemas.DeepIntShieldBatchRetrieveResponse, *schemas.DeepIntShieldError) {
+	providerName := provider.GetProviderKey()
+
+	if request.BatchID == "" {
+		return nil, providerUtils.NewDeepIntShieldOperationError("batch_id is required", nil, providerName)
+	}
+
+	if len(keys) == 0 {
+		return nil, providerUtils.NewConfigurationError("no Azure keys available for batch retrieve operation", providerName)
+	}
+
+	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
+	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
+
+	var lastErr *schemas.DeepIntShieldError
+	for _, key := range keys {
+		if err := provider.validateKeyConfigForFiles(key); err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Get API version
+		apiVersion := key.AzureKeyConfig.APIVersion
+		if apiVersion == nil {
+			apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+		}
+
+		// Create request
+		req := fasthttp.AcquireRequest()
+		resp := fasthttp.AcquireResponse()
+
+		// Build URL with query params
+		baseURL := fmt.Sprintf("%s/openai/batches/%s", key.AzureKeyConfig.Endpoint.GetValue(), url.PathEscape(request.BatchID))
+		values := url.Values{}
+		values.Set("api-version", apiVersion.GetValue())
+		requestURL := baseURL + "?" + values.Encode()
+
+		// Set headers
+		providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+		req.SetRequestURI(requestURL)
+		req.Header.SetMethod(http.MethodGet)
+		req.Header.SetContentType("application/json")
+
+		// Set Azure authentication
+		if authErr := provider.setAzureAuth(ctx, req, key); authErr != nil {
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = authErr
+			continue
+		}
+
+		// Make request
+		latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+		if deepintshieldErr != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = deepintshieldErr
+			continue
+		}
+
+		// Handle error response
+		if resp.StatusCode() != fasthttp.StatusOK {
+			provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
+			lastErr = openai.ParseOpenAIError(resp, schemas.BatchRetrieveRequest, providerName, "")
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			continue
+		}
+
+		body, err := providerUtils.CheckAndDecodeBody(resp)
+		if err != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderResponseDecode, err, providerName)
+			continue
+		}
+
+		var openAIResp openai.OpenAIBatchResponse
+		rawRequest, rawResponse, deepintshieldErr := providerUtils.HandleProviderResponse(body, &openAIResp, nil, sendBackRawRequest, sendBackRawResponse)
+		if deepintshieldErr != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = deepintshieldErr
+			continue
+		}
+
+		wait()
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(resp)
+
+		result := openAIResp.ToDeepIntShieldBatchRetrieveResponse(providerName, latency, sendBackRawRequest, sendBackRawResponse, rawRequest, rawResponse)
+		result.ExtraFields.RequestType = schemas.BatchRetrieveRequest
+		return result, nil
+	}
+
+	return nil, lastErr
+}
+
+// BatchCancel cancels a batch job on Azure OpenAI by trying each key until successful.
+func (provider *AzureProvider) BatchCancel(ctx *schemas.DeepIntShieldContext, keys []schemas.Key, request *schemas.DeepIntShieldBatchCancelRequest) (*schemas.DeepIntShieldBatchCancelResponse, *schemas.DeepIntShieldError) {
+	providerName := provider.GetProviderKey()
+
+	if request.BatchID == "" {
+		return nil, providerUtils.NewDeepIntShieldOperationError("batch_id is required", nil, providerName)
+	}
+
+	if len(keys) == 0 {
+		return nil, providerUtils.NewConfigurationError("no Azure keys available for batch cancel operation", providerName)
+	}
+
+	sendBackRawRequest := providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest)
+	sendBackRawResponse := providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse)
+
+	var lastErr *schemas.DeepIntShieldError
+	for _, key := range keys {
+		if err := provider.validateKeyConfigForFiles(key); err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Get API version
+		apiVersion := key.AzureKeyConfig.APIVersion
+		if apiVersion == nil {
+			apiVersion = schemas.NewEnvVar(AzureAPIVersionDefault)
+		}
+
+		// Create request
+		req := fasthttp.AcquireRequest()
+		resp := fasthttp.AcquireResponse()
+
+		// Build URL with query params
+		baseURL := fmt.Sprintf("%s/openai/batches/%s/cancel", key.AzureKeyConfig.Endpoint.GetValue(), url.PathEscape(request.BatchID))
+		values := url.Values{}
+		values.Set("api-version", apiVersion.GetValue())
+		requestURL := baseURL + "?" + values.Encode()
+
+		// Set headers
+		providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
+		req.SetRequestURI(requestURL)
+		req.Header.SetMethod(http.MethodPost)
+		req.Header.SetContentType("application/json")
+
+		// Set Azure authentication
+		if authErr := provider.setAzureAuth(ctx, req, key); authErr != nil {
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = authErr
+			continue
+		}
+
+		// Make request
+		latency, deepintshieldErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+		if deepintshieldErr != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = deepintshieldErr
+			continue
+		}
+
+		// Handle error response
+		if resp.StatusCode() != fasthttp.StatusOK {
+			provider.logger.Debug("error from %s provider: %s", providerName, string(resp.Body()))
+			lastErr = openai.ParseOpenAIError(resp, schemas.BatchCancelRequest, providerName, "")
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			continue
+		}
+
+		body, err := providerUtils.CheckAndDecodeBody(resp)
+		if err != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = providerUtils.NewDeepIntShieldOperationError(schemas.ErrProviderResponseDecode, err, providerName)
+			continue
+		}
+
+		var openAIResp openai.OpenAIBatchResponse
+		rawRequest, rawResponse, deepintshieldErr := providerUtils.HandleProviderResponse(body, &openAIResp, nil, sendBackRawRequest, sendBackRawResponse)
+		if deepintshieldErr != nil {
+			wait()
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			lastErr = deepintshieldErr
+			continue
+		}
+
+		wait()
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(resp)
+
+		result := &schemas.DeepIntShieldBatchCancelResponse{
+			ID:           openAIResp.ID,
+			Object:       openAIResp.Object,
+			Status:       openai.ToDeepIntShieldBatchStatus(openAIResp.Status),
+			CancellingAt: openAIResp.CancellingAt,
+			CancelledAt:  openAIResp.CancelledAt,
+			ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+				RequestType: schemas.BatchCancelRequest,
+				Provider:    providerName,
+				Latency:     latency.Milliseconds(),
+			},
+		}
+
+		if openAIResp.RequestCounts != nil {
+			result.RequestCounts = schemas.BatchRequestCounts{
+				Total:     openAIResp.RequestCounts.Total,
+				Completed: openAIResp.RequestCounts.Completed,
+				Failed:    openAIResp.RequestCounts.Failed,
+			}
+		}
+
+		if sendBackRawRequest {
+			result.ExtraFields.RawRequest = rawRequest
+		}
+
+		if sendBackRawResponse {
+			result.ExtraFields.RawResponse = rawResponse
+		}
+
+		return result, nil
+	}
+
+	return nil, lastErr
+}
+
+// BatchDelete is not supported by the Azure provider.
+func (provider *AzureProvider) BatchDelete(ctx *schemas.DeepIntShieldContext, keys []schemas.Key, request *schemas.DeepIntShieldBatchDeleteRequest) (*schemas.DeepIntShieldBatchDeleteResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.BatchDeleteRequest, schemas.Azure)
+}
+
+// BatchResults retrieves batch results from Azure OpenAI by trying each key until successful.
+// For Azure (like OpenAI), batch results are obtained by downloading the output_file_id.
+func (provider *AzureProvider) BatchResults(ctx *schemas.DeepIntShieldContext, keys []schemas.Key, request *schemas.DeepIntShieldBatchResultsRequest) (*schemas.DeepIntShieldBatchResultsResponse, *schemas.DeepIntShieldError) {
+	providerName := provider.GetProviderKey()
+
+	// First, retrieve the batch to get the output_file_id (using all keys)
+	batchResp, deepintshieldErr := provider.BatchRetrieve(ctx, keys, &schemas.DeepIntShieldBatchRetrieveRequest{
+		Provider: request.Provider,
+		BatchID:  request.BatchID,
+	})
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	if batchResp.OutputFileID == nil || *batchResp.OutputFileID == "" {
+		return nil, providerUtils.NewDeepIntShieldOperationError("batch results not available: output_file_id is empty (batch may not be completed)", nil, providerName)
+	}
+
+	// Download the output file content (using all keys)
+	fileContentResp, deepintshieldErr := provider.FileContent(ctx, keys, &schemas.DeepIntShieldFileContentRequest{
+		Provider: request.Provider,
+		FileID:   *batchResp.OutputFileID,
+	})
+	if deepintshieldErr != nil {
+		return nil, deepintshieldErr
+	}
+
+	// Parse JSONL content - each line is a separate result
+	var results []schemas.BatchResultItem
+
+	parseResult := providerUtils.ParseJSONL(fileContentResp.Content, func(line []byte) error {
+		var resultItem schemas.BatchResultItem
+		if err := sonic.Unmarshal(line, &resultItem); err != nil {
+			provider.logger.Warn("failed to parse batch result line: %v", err)
+			return err
+		}
+		results = append(results, resultItem)
+		return nil
+	})
+
+	batchResultsResp := &schemas.DeepIntShieldBatchResultsResponse{
+		BatchID: request.BatchID,
+		Results: results,
+		ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+			RequestType: schemas.BatchResultsRequest,
+			Provider:    providerName,
+			Latency:     fileContentResp.ExtraFields.Latency,
+		},
+	}
+
+	if len(parseResult.Errors) > 0 {
+		batchResultsResp.ExtraFields.ParseErrors = parseResult.Errors
+	}
+
+	return batchResultsResp, nil
+}
+
+// CountTokens is not supported by the Azure provider.
+func (provider *AzureProvider) CountTokens(_ *schemas.DeepIntShieldContext, _ schemas.Key, _ *schemas.DeepIntShieldResponsesRequest) (*schemas.DeepIntShieldCountTokensResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.CountTokensRequest, provider.GetProviderKey())
+}
+
+// ContainerCreate is not supported by the Azure provider.
+func (provider *AzureProvider) ContainerCreate(_ *schemas.DeepIntShieldContext, _ schemas.Key, _ *schemas.DeepIntShieldContainerCreateRequest) (*schemas.DeepIntShieldContainerCreateResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerCreateRequest, provider.GetProviderKey())
+}
+
+// ContainerList is not supported by the Azure provider.
+func (provider *AzureProvider) ContainerList(_ *schemas.DeepIntShieldContext, _ []schemas.Key, _ *schemas.DeepIntShieldContainerListRequest) (*schemas.DeepIntShieldContainerListResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerListRequest, provider.GetProviderKey())
+}
+
+// ContainerRetrieve is not supported by the Azure provider.
+func (provider *AzureProvider) ContainerRetrieve(_ *schemas.DeepIntShieldContext, _ []schemas.Key, _ *schemas.DeepIntShieldContainerRetrieveRequest) (*schemas.DeepIntShieldContainerRetrieveResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerRetrieveRequest, provider.GetProviderKey())
+}
+
+// ContainerDelete is not supported by the Azure provider.
+func (provider *AzureProvider) ContainerDelete(_ *schemas.DeepIntShieldContext, _ []schemas.Key, _ *schemas.DeepIntShieldContainerDeleteRequest) (*schemas.DeepIntShieldContainerDeleteResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerDeleteRequest, provider.GetProviderKey())
+}
+
+// ContainerFileCreate is not supported by the Azure provider.
+func (provider *AzureProvider) ContainerFileCreate(_ *schemas.DeepIntShieldContext, _ schemas.Key, _ *schemas.DeepIntShieldContainerFileCreateRequest) (*schemas.DeepIntShieldContainerFileCreateResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerFileCreateRequest, provider.GetProviderKey())
+}
+
+// ContainerFileList is not supported by the Azure provider.
+func (provider *AzureProvider) ContainerFileList(_ *schemas.DeepIntShieldContext, _ []schemas.Key, _ *schemas.DeepIntShieldContainerFileListRequest) (*schemas.DeepIntShieldContainerFileListResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerFileListRequest, provider.GetProviderKey())
+}
+
+// ContainerFileRetrieve is not supported by the Azure provider.
+func (provider *AzureProvider) ContainerFileRetrieve(_ *schemas.DeepIntShieldContext, _ []schemas.Key, _ *schemas.DeepIntShieldContainerFileRetrieveRequest) (*schemas.DeepIntShieldContainerFileRetrieveResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerFileRetrieveRequest, provider.GetProviderKey())
+}
+
+// ContainerFileContent is not supported by the Azure provider.
+func (provider *AzureProvider) ContainerFileContent(_ *schemas.DeepIntShieldContext, _ []schemas.Key, _ *schemas.DeepIntShieldContainerFileContentRequest) (*schemas.DeepIntShieldContainerFileContentResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerFileContentRequest, provider.GetProviderKey())
+}
+
+// ContainerFileDelete is not supported by the Azure provider.
+func (provider *AzureProvider) ContainerFileDelete(_ *schemas.DeepIntShieldContext, _ []schemas.Key, _ *schemas.DeepIntShieldContainerFileDeleteRequest) (*schemas.DeepIntShieldContainerFileDeleteResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ContainerFileDeleteRequest, provider.GetProviderKey())
+}
+
+// Passthrough is not supported by the Azure provider.
+func (provider *AzureProvider) Passthrough(_ *schemas.DeepIntShieldContext, _ schemas.Key, _ *schemas.DeepIntShieldPassthroughRequest) (*schemas.DeepIntShieldPassthroughResponse, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.PassthroughRequest, provider.GetProviderKey())
+}
+
+func (provider *AzureProvider) PassthroughStream(_ *schemas.DeepIntShieldContext, _ schemas.PostHookRunner, _ schemas.Key, _ *schemas.DeepIntShieldPassthroughRequest) (chan *schemas.DeepIntShieldStreamChunk, *schemas.DeepIntShieldError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.PassthroughStreamRequest, provider.GetProviderKey())
+}

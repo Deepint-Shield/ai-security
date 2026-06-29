@@ -1,0 +1,362 @@
+package replicate
+
+import (
+	"strconv"
+	"strings"
+
+	providerUtils "github.com/deepint-shield/ai-security/core/providers/utils"
+	schemas "github.com/deepint-shield/ai-security/core/schemas"
+)
+
+// modelInputImageFieldMap maps model identifiers to their input image field names.
+var modelInputImageFieldMap = map[string]string{
+	// image_prompt models
+	"black-forest-labs/flux-1.1-pro":                 "image_prompt",
+	"black-forest-labs/flux-1.1-pro-ultra":           "image_prompt",
+	"black-forest-labs/flux-pro":                     "image_prompt",
+	"black-forest-labs/flux-1.1-pro-ultra-finetuned": "image_prompt",
+
+	// input_image models (kontext variants)
+	"black-forest-labs/flux-kontext-pro": "input_image",
+	"black-forest-labs/flux-kontext-max": "input_image",
+	"black-forest-labs/flux-kontext-dev": "input_image",
+
+	// image models
+	"black-forest-labs/flux-dev":      "image",
+	"black-forest-labs/flux-fill-pro": "image",
+	"black-forest-labs/flux-dev-lora": "image",
+	"black-forest-labs/flux-krea-dev": "image",
+}
+
+// convertSizeToReplicateFormat converts standard size format (e.g., "1024x1024") to Replicate format.
+// Returns (aspectRatio, imageSize) where imageSize is "1k", "2k", "4k" and aspectRatio is one of:
+// "1:1", "3:4", "4:3", "9:16", or "16:9". Returns empty strings if unparseable or ratio unrecognised.
+func convertSizeToReplicateFormat(size string) (aspectRatio, imageSize string) {
+	parts := strings.Split(size, "x")
+	if len(parts) != 2 {
+		return "", ""
+	}
+
+	width, err1 := strconv.Atoi(parts[0])
+	height, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return "", ""
+	}
+
+	if width <= 0 || height <= 0 {
+		return "", ""
+	}
+
+	if width <= 1024 && height <= 1024 {
+		imageSize = "1K"
+	} else if width <= 2048 && height <= 2048 {
+		imageSize = "2K"
+	} else if width <= 4096 && height <= 4096 {
+		imageSize = "4K"
+	}
+
+	ratio := float64(width) / float64(height)
+	if ratio >= 0.99 && ratio <= 1.01 {
+		aspectRatio = "1:1"
+	} else if ratio >= 0.74 && ratio <= 0.76 {
+		aspectRatio = "3:4"
+	} else if ratio >= 1.32 && ratio <= 1.34 {
+		aspectRatio = "4:3"
+	} else if ratio >= 0.56 && ratio <= 0.57 {
+		aspectRatio = "9:16"
+	} else if ratio >= 1.77 && ratio <= 1.78 {
+		aspectRatio = "16:9"
+	}
+
+	return aspectRatio, imageSize
+}
+
+// ToReplicateImageGenerationInput converts a DeepIntShield image generation request to Replicate prediction input
+func ToReplicateImageGenerationInput(deepintshieldReq *schemas.DeepIntShieldImageGenerationRequest) *ReplicatePredictionRequest {
+	if deepintshieldReq == nil || deepintshieldReq.Input == nil {
+		return nil
+	}
+
+	input := &ReplicatePredictionRequestInput{
+		Prompt: &deepintshieldReq.Input.Prompt,
+	}
+
+	// Map parameters if available
+	if deepintshieldReq.Params != nil {
+		params := deepintshieldReq.Params
+
+		// Map InputImages to the appropriate field based on model
+		if len(params.InputImages) > 0 {
+			fieldName := getInputImageFieldName(deepintshieldReq.Model)
+
+			switch fieldName {
+			case "image_prompt":
+				// For flux-1.1-pro variants: use first image as image_prompt
+				input.ImagePrompt = &params.InputImages[0]
+
+			case "input_image":
+				// For flux-kontext variants: add to ExtraParams as input_image
+				input.InputImage = &params.InputImages[0]
+
+			case "image":
+				// For flux-dev variants: use first image as image field
+				input.Image = &params.InputImages[0]
+
+			case "input_images":
+				// For all other models: use input_images array
+				input.InputImages = params.InputImages
+			}
+		}
+
+		if deepintshieldReq.Params.N != nil {
+			input.NumberOfImages = deepintshieldReq.Params.N
+		}
+
+		if params.AspectRatio != nil {
+			input.AspectRatio = params.AspectRatio
+		}
+
+		if params.Size != nil {
+			aspectRatio, imageSize := convertSizeToReplicateFormat(*params.Size)
+			_, hasExplicitResolution := params.ExtraParams["resolution"]
+			if params.AspectRatio == nil && aspectRatio != "" {
+				input.AspectRatio = &aspectRatio
+			}
+			if imageSize != "" && !hasExplicitResolution {
+				input.Resolution = &imageSize
+			}
+		}
+
+		// Map OutputFormat
+		if params.OutputFormat != nil {
+			input.OutputFormat = params.OutputFormat
+		}
+
+		if params.Quality != nil {
+			input.Quality = params.Quality
+		}
+
+		if params.Background != nil {
+			input.Background = params.Background
+		}
+
+		// Map Seed
+		if params.Seed != nil {
+			input.Seed = params.Seed
+		}
+
+		// Map NegativePrompt
+		if params.NegativePrompt != nil {
+			input.NegativePrompt = params.NegativePrompt
+		}
+
+		// Map NumInferenceSteps
+		if params.NumInferenceSteps != nil {
+			input.NumInferenceStep = params.NumInferenceSteps
+		}
+
+		if params.ExtraParams != nil {
+			input.ExtraParams = params.ExtraParams
+		}
+	}
+
+	request := &ReplicatePredictionRequest{
+		Input: input,
+	}
+
+	// Check if model is a version ID and set version field accordingly
+	if isVersionID(deepintshieldReq.Model) {
+		request.Version = &deepintshieldReq.Model
+	}
+
+	if deepintshieldReq.Params != nil && deepintshieldReq.Params.ExtraParams != nil {
+		if webhook, ok := schemas.SafeExtractStringPointer(deepintshieldReq.Params.ExtraParams["webhook"]); ok {
+			request.Webhook = webhook
+		}
+		if webhookEventsFilter, ok := schemas.SafeExtractStringSlice(deepintshieldReq.Params.ExtraParams["webhook_events_filter"]); ok {
+			request.WebhookEventsFilter = webhookEventsFilter
+		}
+	}
+
+	return request
+}
+
+// ToDeepIntShieldImageGenerationResponse converts a Replicate prediction response to DeepIntShield format
+func ToDeepIntShieldImageGenerationResponse(
+	prediction *ReplicatePredictionResponse,
+) (*schemas.DeepIntShieldImageGenerationResponse, *schemas.DeepIntShieldError) {
+	if prediction == nil {
+		return nil, &schemas.DeepIntShieldError{
+			IsDeepIntShieldError: true,
+			Error: &schemas.ErrorField{
+				Message: "prediction response is nil",
+			},
+			ExtraFields: schemas.DeepIntShieldErrorExtraFields{
+				Provider: schemas.Replicate,
+			},
+		}
+	}
+
+	response := &schemas.DeepIntShieldImageGenerationResponse{
+		ID:      prediction.ID,
+		Created: ParseReplicateTimestamp(prediction.CreatedAt),
+		Model:   prediction.Model,
+		Data:    []schemas.ImageData{},
+	}
+
+	// Convert output to ImageData
+	// Replicate output can be either a string (single URL) or array of strings
+	if prediction.Output != nil {
+		if prediction.Output.OutputStr != nil && *prediction.Output.OutputStr != "" {
+			response.Data = append(response.Data, schemas.ImageData{
+				URL:   *prediction.Output.OutputStr,
+				Index: 0,
+			})
+		} else if len(prediction.Output.OutputArray) > 0 {
+			for i, url := range prediction.Output.OutputArray {
+				response.Data = append(response.Data, schemas.ImageData{
+					URL:   url,
+					Index: i,
+				})
+			}
+		}
+	}
+
+	// Extract usage information from logs
+	if prediction.Logs != nil {
+		inputTokens, outputTokens, totalTokens, found := parseTokenUsageFromLogs(prediction.Logs, schemas.ImageGenerationRequest)
+		if found {
+			response.Usage = &schemas.ImageUsage{
+				InputTokens:  inputTokens,
+				OutputTokens: outputTokens,
+				TotalTokens:  totalTokens,
+			}
+		}
+	}
+
+	return response, nil
+}
+
+// getInputImageFieldName returns the appropriate input image field name based on the model.
+// Uses O(1) map lookup for high RPS performance.
+func getInputImageFieldName(model string) string {
+	// Normalize model name to lowercase for comparison
+	modelLower := strings.ToLower(model)
+
+	// Extract model identifier (handle both "owner/name" and "owner/name:version" formats)
+	modelIdentifier := modelLower
+	if before, _, ok := strings.Cut(modelLower, ":"); ok {
+		modelIdentifier = before
+	}
+
+	if fieldName, exists := modelInputImageFieldMap[modelIdentifier]; exists {
+		return fieldName
+	}
+
+	// Default to input_images for all other models
+	return "input_images"
+}
+
+// ToReplicateImageEditInput converts a DeepIntShield image edit request to Replicate prediction input
+func ToReplicateImageEditInput(deepintshieldReq *schemas.DeepIntShieldImageEditRequest) *ReplicatePredictionRequest {
+	if deepintshieldReq == nil || deepintshieldReq.Input == nil {
+		return nil
+	}
+
+	input := &ReplicatePredictionRequestInput{
+		Prompt: &deepintshieldReq.Input.Prompt,
+	}
+
+	// Map image URLs - Replicate requires image URLs, not file bytes
+	if len(deepintshieldReq.Input.Images) > 0 {
+		images := make([]string, 0, len(deepintshieldReq.Input.Images))
+		for _, img := range deepintshieldReq.Input.Images {
+			if len(img.Image) > 0 {
+				images = append(images, providerUtils.FileBytesToBase64DataURL(img.Image))
+			}
+		}
+
+		if len(images) > 0 {
+			// Determine the appropriate field based on model
+			fieldName := getInputImageFieldName(deepintshieldReq.Model)
+
+			switch fieldName {
+			case "image_prompt":
+				// For flux-1.1-pro variants: use first image as image_prompt
+				input.ImagePrompt = &images[0]
+
+			case "input_image":
+				// For flux-kontext variants: use first image as input_image
+				input.InputImage = &images[0]
+
+			case "image":
+				// For flux-dev variants: use first image as image field
+				input.Image = &images[0]
+
+			case "input_images":
+				// For all other models: use input_images array
+				input.InputImages = images
+			}
+		}
+	}
+
+	// Map parameters if available
+	if deepintshieldReq.Params != nil {
+		params := deepintshieldReq.Params
+
+		if params.N != nil {
+			input.NumberOfImages = params.N
+		}
+
+		if params.Size != nil {
+			aspectRatio, imageSize := convertSizeToReplicateFormat(*params.Size)
+			_, hasExplicitAspectRatio := params.ExtraParams["aspect_ratio"]
+			_, hasExplicitResolution := params.ExtraParams["resolution"]
+			if aspectRatio != "" && !hasExplicitAspectRatio {
+				input.AspectRatio = &aspectRatio
+			}
+			if imageSize != "" && !hasExplicitResolution {
+				input.Resolution = &imageSize
+			}
+		}
+
+		if params.OutputFormat != nil {
+			input.OutputFormat = params.OutputFormat
+		}
+
+		if params.Quality != nil {
+			input.Quality = params.Quality
+		}
+
+		if params.Background != nil {
+			input.Background = params.Background
+		}
+
+		if params.Seed != nil {
+			input.Seed = params.Seed
+		}
+
+		if params.NegativePrompt != nil {
+			input.NegativePrompt = params.NegativePrompt
+		}
+
+		if params.NumInferenceSteps != nil {
+			input.NumInferenceStep = params.NumInferenceSteps
+		}
+
+		if params.ExtraParams != nil {
+			input.ExtraParams = params.ExtraParams
+		}
+	}
+
+	request := &ReplicatePredictionRequest{
+		Input: input,
+	}
+
+	// Check if model is a version ID and set version field accordingly
+	if isVersionID(deepintshieldReq.Model) {
+		request.Version = &deepintshieldReq.Model
+	}
+
+	return request
+}

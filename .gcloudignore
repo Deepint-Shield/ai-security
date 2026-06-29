@@ -1,0 +1,27 @@
+# Context uploaded to Cloud Build when build_and_push.sh runs in cloud mode.
+# Honour .gitignore + extra build-context exclusions.
+#!include:.gitignore
+
+.git/
+.github/
+node_modules/
+**/node_modules/
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/venv/
+**/.next/
+**/dist/
+**/build/
+**/coverage/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.DS_Store
+
+# Docs and deployment scratch — not needed in the build context
+deepintshield_server/docs/
+deployment/tiers/cloud/.env
+*.log
+tmp/
+.claude/

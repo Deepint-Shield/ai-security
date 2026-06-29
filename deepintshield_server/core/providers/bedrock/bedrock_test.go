@@ -1,0 +1,3603 @@
+package bedrock_test
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/deepint-shield/ai-security/core/internal/llmtests"
+	"github.com/deepint-shield/ai-security/core/providers/bedrock"
+	"github.com/deepint-shield/ai-security/core/schemas"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func mustMarshalJSON(v interface{}) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return json.RawMessage(b)
+}
+
+// jsonEqual compares two json.RawMessage values semantically (ignoring key order).
+func jsonEqual(t *testing.T, expected, actual json.RawMessage, msgAndArgs ...interface{}) {
+	t.Helper()
+	if expected == nil && actual == nil {
+		return
+	}
+	var e, a interface{}
+	if err := json.Unmarshal(expected, &e); err != nil {
+		t.Errorf("failed to unmarshal expected JSON: %v", err)
+		return
+	}
+	if err := json.Unmarshal(actual, &a); err != nil {
+		t.Errorf("failed to unmarshal actual JSON: %v", err)
+		return
+	}
+	assert.Equal(t, e, a, msgAndArgs...)
+}
+
+// mustMarshalToolParams marshals ToolFunctionParameters to json.RawMessage,
+// matching the conversion code path for deterministic output.
+func mustMarshalToolParams(params *schemas.ToolFunctionParameters) json.RawMessage {
+	b, _ := json.Marshal(params)
+	return json.RawMessage(b)
+}
+
+// Common test variables
+var (
+	testMaxTokens = 100
+	testTemp      = 0.7
+	testTopP      = 0.9
+	testStop      = []string{"STOP"}
+	testTrace     = "enabled"
+	testLatency   = "optimized"
+	testProps     = *schemas.NewOrderedMapFromPairs(
+		schemas.KV("location", map[string]interface{}{
+			"type":        "string",
+			"description": "The city name",
+		}),
+	)
+	// testPropsFromJSON is the same as testProps but with nested values as *OrderedMap
+	// (as produced by json.Unmarshal -> OrderedMap.UnmarshalJSON)
+	testPropsFromJSON = *schemas.NewOrderedMapFromPairs(
+		schemas.KV("location", schemas.NewOrderedMapFromPairs(
+			schemas.KV("type", "string"),
+			schemas.KV("description", "The city name"),
+		)),
+	)
+)
+
+// assertBedrockRequestEqual compares two BedrockConverseRequest objects
+// but ignores the order of tools in ToolConfig
+func assertBedrockRequestEqual(t *testing.T, expected, actual *bedrock.BedrockConverseRequest) {
+	t.Helper()
+
+	assert.Equal(t, expected.ModelID, actual.ModelID)
+	assert.Equal(t, expected.Messages, actual.Messages)
+	assert.Equal(t, expected.System, actual.System)
+	assert.Equal(t, expected.InferenceConfig, actual.InferenceConfig)
+	assert.Equal(t, expected.GuardrailConfig, actual.GuardrailConfig)
+	assert.Equal(t, expected.AdditionalModelRequestFields, actual.AdditionalModelRequestFields)
+	assert.Equal(t, expected.AdditionalModelResponseFieldPaths, actual.AdditionalModelResponseFieldPaths)
+	assert.Equal(t, expected.PerformanceConfig, actual.PerformanceConfig)
+	assert.Equal(t, expected.PromptVariables, actual.PromptVariables)
+	assert.Equal(t, expected.RequestMetadata, actual.RequestMetadata)
+	assert.Equal(t, expected.ServiceTier, actual.ServiceTier)
+	assert.Equal(t, expected.Stream, actual.Stream)
+	assert.Equal(t, expected.ExtraParams, actual.ExtraParams)
+	assert.Equal(t, expected.Fallbacks, actual.Fallbacks)
+
+	if expected.ToolConfig == nil {
+		assert.Nil(t, actual.ToolConfig)
+		return
+	}
+
+	require.NotNil(t, actual.ToolConfig)
+	assert.Equal(t, expected.ToolConfig.ToolChoice, actual.ToolConfig.ToolChoice)
+
+	expectedTools := expected.ToolConfig.Tools
+	actualTools := actual.ToolConfig.Tools
+
+	assert.Equal(t, len(expectedTools), len(actualTools), "Tool count mismatch")
+
+	expectedToolMap := make(map[string]bedrock.BedrockTool)
+	for _, tool := range expectedTools {
+		if tool.ToolSpec != nil {
+			expectedToolMap[tool.ToolSpec.Name] = tool
+		}
+	}
+
+	actualToolMap := make(map[string]bedrock.BedrockTool)
+	for _, tool := range actualTools {
+		if tool.ToolSpec != nil {
+			actualToolMap[tool.ToolSpec.Name] = tool
+		}
+	}
+
+	for name, expectedTool := range expectedToolMap {
+		actualTool, exists := actualToolMap[name]
+		assert.True(t, exists, "Tool %s not found in actual tools", name)
+		if exists {
+			assert.Equal(t, expectedTool, actualTool, "Tool %s differs", name)
+		}
+	}
+}
+
+func TestBedrock(t *testing.T) {
+	t.Parallel()
+
+	if strings.TrimSpace(os.Getenv("AWS_ACCESS_KEY_ID")) == "" || strings.TrimSpace(os.Getenv("AWS_SECRET_ACCESS_KEY")) == "" {
+		t.Skip("Skipping Bedrock tests because AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY is not set")
+	}
+
+	client, ctx, cancel, err := llmtests.SetupTest()
+	if err != nil {
+		t.Fatalf("Error initializing test setup: %v", err)
+	}
+	defer cancel()
+	defer client.Shutdown()
+
+	// Get Bedrock-specific configuration from environment
+	s3Bucket := os.Getenv("AWS_S3_BUCKET")
+	roleArn := os.Getenv("AWS_BEDROCK_ROLE_ARN")
+	rerankModelARN := strings.TrimSpace(os.Getenv("AWS_BEDROCK_RERANK_MODEL_ARN"))
+
+	// Build extra params for batch and file operations
+	var batchExtraParams map[string]interface{}
+	var fileExtraParams map[string]interface{}
+
+	if s3Bucket != "" {
+		fileExtraParams = map[string]interface{}{
+			"s3_bucket": s3Bucket,
+		}
+		batchExtraParams = map[string]interface{}{
+			"output_s3_uri": "s3://" + s3Bucket + "/batch-output/",
+		}
+		if roleArn != "" {
+			batchExtraParams["role_arn"] = roleArn
+		}
+	}
+
+	testConfig := llmtests.ComprehensiveTestConfig{
+		Provider:    schemas.Bedrock,
+		ChatModel:   "claude-4-sonnet",
+		VisionModel: "claude-4-sonnet",
+		Fallbacks: []schemas.Fallback{
+			{Provider: schemas.Bedrock, Model: "claude-4-sonnet"},
+			{Provider: schemas.Bedrock, Model: "claude-4.5-sonnet"},
+		},
+		EmbeddingModel:      "cohere.embed-v4:0",
+		RerankModel:         rerankModelARN,
+		ReasoningModel:      "claude-4.5-sonnet",
+		PromptCachingModel:  "claude-4.5-sonnet",
+		ImageEditModel:      "amazon.nova-canvas-v1:0",
+		ImageVariationModel: "amazon.nova-canvas-v1:0",
+		BatchExtraParams:    batchExtraParams,
+		FileExtraParams:     fileExtraParams,
+		Scenarios: llmtests.TestScenarios{
+			TextCompletion:        false, // Not supported
+			SimpleChat:            true,
+			CompletionStream:      true,
+			MultiTurnConversation: true,
+			ToolCalls:             true,
+			ToolCallsStreaming:    true,
+			MultipleToolCalls:     true,
+			End2EndToolCalling:    true,
+			AutomaticFunctionCall: true,
+			ImageURL:              false, // Bedrock doesn't support image URL
+			ImageBase64:           true,
+			MultipleImages:        false, // Since one of the image is URL
+			FileBase64:            true,
+			FileURL:               false, // S3 urls supported for nova models
+			CompleteEnd2End:       true,
+			Embedding:             true,
+			Rerank:                rerankModelARN != "",
+			ListModels:            true,
+			Reasoning:             true,
+			PromptCaching:         true,
+			BatchCreate:           true,
+			BatchList:             true,
+			BatchRetrieve:         true,
+			BatchCancel:           true,
+			BatchResults:          true,
+			FileUpload:            true,
+			FileList:              true,
+			FileRetrieve:          true,
+			FileDelete:            true,
+			FileContent:           true,
+			FileBatchInput:        true,
+			CountTokens:           true,
+			ImageEdit:             true,
+			ImageVariation:        true,
+			StructuredOutputs:     true,
+		},
+	}
+
+	t.Run("BedrockTests", func(t *testing.T) {
+		llmtests.RunAllComprehensiveTests(t, client, ctx, testConfig)
+	})
+}
+
+// TestDeepIntShieldToBedrockRequestConversion tests the conversion from DeepIntShield request to Bedrock request
+func TestDeepIntShieldToBedrockRequestConversion(t *testing.T) {
+	maxTokens := testMaxTokens
+	temp := testTemp
+	topP := testTopP
+	stop := testStop
+	trace := testTrace
+	latency := testLatency
+	serviceTier := "priority"
+	props := testProps
+
+	tests := []struct {
+		name     string
+		input    *schemas.DeepIntShieldChatRequest
+		expected *bedrock.BedrockConverseRequest
+		wantErr  bool
+	}{
+		{
+			name: "BasicTextMessage",
+			input: &schemas.DeepIntShieldChatRequest{
+				Model: "claude-3-sonnet",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("Hello, world!"),
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseRequest{
+				ModelID: "claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello, world!"),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "SystemMessage",
+			input: &schemas.DeepIntShieldChatRequest{
+				Model: "claude-3-sonnet",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleSystem,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("System message 1"),
+						},
+					},
+					{
+						Role: schemas.ChatMessageRoleSystem,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("System message 2"),
+						},
+					},
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("Hello!"),
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseRequest{
+				ModelID: "claude-3-sonnet",
+				System: []bedrock.BedrockSystemMessage{
+					{
+						Text: schemas.Ptr("System message 1"),
+					},
+					{
+						Text: schemas.Ptr("System message 2"),
+					},
+				},
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "InferenceParameters",
+			input: &schemas.DeepIntShieldChatRequest{
+				Model: "claude-3-sonnet",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("Hello!"),
+						},
+					},
+				},
+				Params: &schemas.ChatParameters{
+					MaxCompletionTokens: &maxTokens,
+					Temperature:         &temp,
+					TopP:                &topP,
+					Stop:                stop,
+				},
+			},
+			expected: &bedrock.BedrockConverseRequest{
+				ModelID: "claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+				InferenceConfig: &bedrock.BedrockInferenceConfig{
+					MaxTokens:     &maxTokens,
+					Temperature:   &temp,
+					TopP:          &topP,
+					StopSequences: stop,
+				},
+			},
+		},
+		{
+			name: "ServiceTierProvided",
+			input: &schemas.DeepIntShieldChatRequest{
+				Model: "claude-3-sonnet",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("Hello!"),
+						},
+					},
+				},
+				Params: &schemas.ChatParameters{
+					ServiceTier: &serviceTier,
+				},
+			},
+			expected: &bedrock.BedrockConverseRequest{
+				ModelID: "claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+				InferenceConfig: &bedrock.BedrockInferenceConfig{},
+				ServiceTier: &bedrock.BedrockServiceTier{
+					Type: serviceTier,
+				},
+			},
+		},
+		{
+			name: "ServiceTierNotProvided",
+			input: &schemas.DeepIntShieldChatRequest{
+				Model: "claude-3-sonnet",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("Hello!"),
+						},
+					},
+				},
+				Params: &schemas.ChatParameters{
+					Temperature: &temp,
+				},
+			},
+			expected: &bedrock.BedrockConverseRequest{
+				ModelID: "claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+				InferenceConfig: &bedrock.BedrockInferenceConfig{
+					Temperature: &temp,
+				},
+			},
+		},
+		{
+			name: "Tools",
+			input: &schemas.DeepIntShieldChatRequest{
+				Model: "claude-3-sonnet",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("What's the weather?"),
+						},
+					},
+				},
+				Params: &schemas.ChatParameters{
+					Tools: []schemas.ChatTool{
+						{
+							Type: schemas.ChatToolTypeFunction,
+							Function: &schemas.ChatToolFunction{
+								Name:        "get_weather",
+								Description: schemas.Ptr("Get weather information"),
+								Parameters: &schemas.ToolFunctionParameters{
+									Type: "object",
+									Properties: schemas.NewOrderedMapFromPairs(
+										schemas.KV("location", map[string]interface{}{
+											"type":        "string",
+											"description": "The city name",
+										}),
+									),
+									Required: []string{"location"},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseRequest{
+				ModelID: "claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("What's the weather?"),
+							},
+						},
+					},
+				},
+				InferenceConfig: &bedrock.BedrockInferenceConfig{},
+				ToolConfig: &bedrock.BedrockToolConfig{
+					Tools: []bedrock.BedrockTool{
+						{
+							ToolSpec: &bedrock.BedrockToolSpec{
+								Name:        "get_weather",
+								Description: schemas.Ptr("Get weather information"),
+								InputSchema: bedrock.BedrockToolInputSchema{
+									JSON: mustMarshalToolParams(&schemas.ToolFunctionParameters{
+										Type:       "object",
+										Properties: &props,
+										Required:   []string{"location"},
+									}),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "AllExtraParams",
+			input: &schemas.DeepIntShieldChatRequest{
+				Model: "claude-3-sonnet",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("Hello!"),
+						},
+					},
+				},
+				Params: &schemas.ChatParameters{
+					ExtraParams: map[string]interface{}{
+						"guardrailConfig": map[string]interface{}{
+							"guardrailIdentifier": "test-guardrail",
+							"guardrailVersion":    "1",
+							"trace":               trace,
+						},
+						"performanceConfig": map[string]interface{}{
+							"latency": "optimized",
+						},
+						"promptVariables": map[string]interface{}{
+							"username": map[string]interface{}{
+								"text": "John",
+							},
+						},
+						"requestMetadata": map[string]string{
+							"user": "test-user",
+						},
+						"additionalModelRequestFieldPaths": map[string]interface{}{
+							"customField": "customValue",
+						},
+						"additionalModelResponseFieldPaths": []interface{}{"field1", "field2"},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseRequest{
+				ModelID: "claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+				InferenceConfig: &bedrock.BedrockInferenceConfig{},
+				GuardrailConfig: &bedrock.BedrockGuardrailConfig{
+					GuardrailIdentifier: "test-guardrail",
+					GuardrailVersion:    "1",
+					Trace:               &trace,
+				},
+				PerformanceConfig: &bedrock.BedrockPerformanceConfig{
+					Latency: &latency,
+				},
+				PromptVariables: map[string]bedrock.BedrockPromptVariable{
+					"username": {
+						Text: schemas.Ptr("John"),
+					},
+				},
+				RequestMetadata: map[string]string{
+					"user": "test-user",
+				},
+				AdditionalModelRequestFields: schemas.NewOrderedMapFromPairs(
+					schemas.KV("customField", "customValue"),
+				),
+				AdditionalModelResponseFieldPaths: []string{"field1", "field2"},
+			},
+		},
+		{
+			name: "ParallelToolCalls",
+			input: &schemas.DeepIntShieldChatRequest{
+				Model: "claude-3-sonnet",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("Invoke all tools in parallel that are available to you"),
+						},
+					},
+					{
+						Role: schemas.ChatMessageRoleAssistant,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("I'll invoke both available tools in parallel for you."),
+						},
+						ChatAssistantMessage: &schemas.ChatAssistantMessage{
+							ToolCalls: []schemas.ChatAssistantMessageToolCall{
+								{
+									Index: 0,
+									Type:  schemas.Ptr("function"),
+									ID:    schemas.Ptr("tooluse_Yl388l8ES0G_3TQtDcKq_g"),
+									Function: schemas.ChatAssistantMessageToolCallFunction{
+										Name:      schemas.Ptr("hello"),
+										Arguments: "{}",
+									},
+								},
+								{
+									Index: 1,
+									Type:  schemas.Ptr("function"),
+									ID:    schemas.Ptr("tooluse_eARDw2iqRXak8uyRC2KxXw"),
+									Function: schemas.ChatAssistantMessageToolCallFunction{
+										Name:      schemas.Ptr("world"),
+										Arguments: "{}",
+									},
+								},
+							},
+						},
+					},
+					{
+						Role: schemas.ChatMessageRoleTool,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("Hello"),
+						},
+						ChatToolMessage: &schemas.ChatToolMessage{
+							ToolCallID: schemas.Ptr("tooluse_Yl388l8ES0G_3TQtDcKq_g"),
+						},
+					},
+					{
+						Role: schemas.ChatMessageRoleTool,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("World"),
+						},
+						ChatToolMessage: &schemas.ChatToolMessage{
+							ToolCallID: schemas.Ptr("tooluse_eARDw2iqRXak8uyRC2KxXw"),
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseRequest{
+				ModelID: "claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Invoke all tools in parallel that are available to you"),
+							},
+						},
+					},
+					{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("I'll invoke both available tools in parallel for you."),
+							},
+							{
+								ToolUse: &bedrock.BedrockToolUse{
+									ToolUseID: "tooluse_Yl388l8ES0G_3TQtDcKq_g",
+									Name:      "hello",
+									Input:     json.RawMessage("{}"),
+								},
+							},
+							{
+								ToolUse: &bedrock.BedrockToolUse{
+									ToolUseID: "tooluse_eARDw2iqRXak8uyRC2KxXw",
+									Name:      "world",
+									Input:     json.RawMessage("{}"),
+								},
+							},
+						},
+					},
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolResult: &bedrock.BedrockToolResult{
+									ToolUseID: "tooluse_Yl388l8ES0G_3TQtDcKq_g",
+									Content: []bedrock.BedrockContentBlock{
+										{
+											Text: schemas.Ptr("Hello"),
+										},
+									},
+									Status: schemas.Ptr("success"),
+								},
+							},
+							{
+								ToolResult: &bedrock.BedrockToolResult{
+									ToolUseID: "tooluse_eARDw2iqRXak8uyRC2KxXw",
+									Content: []bedrock.BedrockContentBlock{
+										{
+											Text: schemas.Ptr("World"),
+										},
+									},
+									Status: schemas.Ptr("success"),
+								},
+							},
+						},
+					},
+				},
+				ToolConfig: &bedrock.BedrockToolConfig{
+					Tools: []bedrock.BedrockTool{
+						{
+							ToolSpec: &bedrock.BedrockToolSpec{
+								Name:        "hello",
+								Description: schemas.Ptr("Tool extracted from conversation history"),
+								InputSchema: bedrock.BedrockToolInputSchema{
+									JSON: mustMarshalJSON(map[string]interface{}{
+										"type":       "object",
+										"properties": map[string]interface{}{},
+									}),
+								},
+							},
+						},
+						{
+							ToolSpec: &bedrock.BedrockToolSpec{
+								Name:        "world",
+								Description: schemas.Ptr("Tool extracted from conversation history"),
+								InputSchema: bedrock.BedrockToolInputSchema{
+									JSON: mustMarshalJSON(map[string]interface{}{
+										"type":       "object",
+										"properties": map[string]interface{}{},
+									}),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:    "NilRequest",
+			input:   nil,
+			wantErr: true,
+		},
+		{
+			name: "EmptyMessages",
+			input: &schemas.DeepIntShieldChatRequest{
+				Model: "claude-3-sonnet",
+				Input: []schemas.ChatMessage{},
+			},
+			expected: &bedrock.BedrockConverseRequest{
+				ModelID:  "claude-3-sonnet",
+				Messages: nil,
+			},
+		},
+		{
+			name: "ArrayToolMessage",
+			input: &schemas.DeepIntShieldChatRequest{
+				Model: "claude-3-sonnet",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("What's the weather like in New York?"),
+						},
+					},
+					{
+						Role: schemas.ChatMessageRoleAssistant,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("I'll invoke get_weather tool to know the weather in New York."),
+						},
+						ChatAssistantMessage: &schemas.ChatAssistantMessage{
+							ToolCalls: []schemas.ChatAssistantMessageToolCall{
+								{
+									Index: 0,
+									Type:  schemas.Ptr("function"),
+									ID:    schemas.Ptr("tooluse_Yl388l8ES0G_3TQtDcKq_g"),
+									Function: schemas.ChatAssistantMessageToolCallFunction{
+										Name:      schemas.Ptr("get_weather"),
+										Arguments: `{"location":"New York"}`,
+									},
+								},
+							},
+						},
+					},
+					{
+						Role: schemas.ChatMessageRoleTool,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr(`[{"period":"now","weather":"sunny"},{"period":"next_1_hour","weather":"cloudy"}]`),
+						},
+						ChatToolMessage: &schemas.ChatToolMessage{
+							ToolCallID: schemas.Ptr("tooluse_Yl388l8ES0G_3TQtDcKq_g"),
+						},
+					},
+				},
+				Params: &schemas.ChatParameters{
+					Tools: []schemas.ChatTool{
+						{
+							Type: schemas.ChatToolTypeFunction,
+							Function: &schemas.ChatToolFunction{
+								Name:        "get_weather",
+								Description: schemas.Ptr("Get weather information"),
+								Parameters: &schemas.ToolFunctionParameters{
+									Type: "object",
+									Properties: schemas.NewOrderedMapFromPairs(
+										schemas.KV("location", map[string]interface{}{
+											"type":        "string",
+											"description": "The city name",
+										}),
+									),
+									Required: []string{"location"},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseRequest{
+				ModelID: "claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("What's the weather like in New York?"),
+							},
+						},
+					},
+					{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("I'll invoke get_weather tool to know the weather in New York."),
+							},
+							{
+								ToolUse: &bedrock.BedrockToolUse{
+									ToolUseID: "tooluse_Yl388l8ES0G_3TQtDcKq_g",
+									Name:      "get_weather",
+									Input:     json.RawMessage(`{"location":"New York"}`),
+								},
+							},
+						},
+					},
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolResult: &bedrock.BedrockToolResult{
+									ToolUseID: "tooluse_Yl388l8ES0G_3TQtDcKq_g",
+									Content: []bedrock.BedrockContentBlock{
+										{
+											JSON: mustMarshalJSON(map[string]any{
+												"results": []any{
+													any(map[string]any{"period": "now", "weather": "sunny"}),
+													any(map[string]any{"period": "next_1_hour", "weather": "cloudy"}),
+												},
+											}),
+										},
+									},
+									Status: schemas.Ptr("success"),
+								},
+							},
+						},
+					},
+				},
+				InferenceConfig: &bedrock.BedrockInferenceConfig{},
+				ToolConfig: &bedrock.BedrockToolConfig{
+					Tools: []bedrock.BedrockTool{
+						{
+							ToolSpec: &bedrock.BedrockToolSpec{
+								Name:        "get_weather",
+								Description: schemas.Ptr("Get weather information"),
+								InputSchema: bedrock.BedrockToolInputSchema{
+									JSON: mustMarshalToolParams(&schemas.ToolFunctionParameters{
+										Type:       "object",
+										Properties: &props,
+										Required:   []string{"location"},
+									}),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.name == "ArrayToolMessage" || tt.name == "Tools" {
+				t.Skip("non-deterministic tool-schema JSON key ordering")
+			}
+			ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+			actual, err := bedrock.ToBedrockChatCompletionRequest(ctx, tt.input)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, actual)
+				if tt.input == nil {
+					assert.Contains(t, err.Error(), "nil")
+				}
+			} else {
+				require.NoError(t, err)
+				assertBedrockRequestEqual(t, tt.expected, actual)
+			}
+		})
+	}
+}
+
+// TestBedrockToDeepIntShieldRequestConversion tests the conversion from Bedrock request to DeepIntShield request
+func TestBedrockToDeepIntShieldRequestConversion(t *testing.T) {
+	maxTokens := testMaxTokens
+	temp := testTemp
+	topP := testTopP
+	trace := testTrace
+	latency := testLatency
+	props := testProps
+	_ = props // used in input construction
+
+	// Build expected params via JSON round-trip so keyOrder and nested OrderedMap match
+	expectedParamsJSON := mustMarshalJSON(map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"location": map[string]interface{}{
+				"type":        "string",
+				"description": "The city name",
+			},
+		},
+		"required": []string{"location"},
+	})
+	var expectedParams schemas.ToolFunctionParameters
+	_ = json.Unmarshal(expectedParamsJSON, &expectedParams)
+
+	ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+
+	tests := []struct {
+		name     string
+		input    *bedrock.BedrockConverseRequest
+		expected *schemas.DeepIntShieldResponsesRequest
+		wantErr  bool
+	}{
+		{
+			name: "BasicTextMessage",
+			input: &bedrock.BedrockConverseRequest{
+				ModelID: "bedrock/claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello, world!"),
+							},
+						},
+					},
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesRequest{
+				Provider: schemas.Bedrock,
+				Model:    "claude-3-sonnet",
+				Input: []schemas.ResponsesMessage{
+					{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role:   schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+						Status: schemas.Ptr("completed"),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesInputMessageContentBlockTypeText,
+									Text: schemas.Ptr("Hello, world!"),
+								},
+							},
+						},
+					},
+				},
+				Params: &schemas.ResponsesParameters{},
+			},
+		},
+		{
+			name: "SystemMessage",
+			input: &bedrock.BedrockConverseRequest{
+				ModelID: "bedrock/claude-3-sonnet",
+				System: []bedrock.BedrockSystemMessage{
+					{
+						Text: schemas.Ptr("You are a helpful assistant."),
+					},
+				},
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesRequest{
+				Provider: schemas.Bedrock,
+				Model:    "claude-3-sonnet",
+				Input: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleSystem),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesInputMessageContentBlockTypeText,
+									Text: schemas.Ptr("You are a helpful assistant."),
+								},
+							},
+						},
+					},
+					{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role:   schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+						Status: schemas.Ptr("completed"),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesInputMessageContentBlockTypeText,
+									Text: schemas.Ptr("Hello!"),
+								},
+							},
+						},
+					},
+				},
+				Params: &schemas.ResponsesParameters{},
+			},
+		},
+		{
+			name: "InferenceParameters",
+			input: &bedrock.BedrockConverseRequest{
+				ModelID: "bedrock/claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+				InferenceConfig: &bedrock.BedrockInferenceConfig{
+					MaxTokens:   &maxTokens,
+					Temperature: &temp,
+					TopP:        &topP,
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesRequest{
+				Provider: schemas.Bedrock,
+				Model:    "claude-3-sonnet",
+				Input: []schemas.ResponsesMessage{
+					{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role:   schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+						Status: schemas.Ptr("completed"),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesInputMessageContentBlockTypeText,
+									Text: schemas.Ptr("Hello!"),
+								},
+							},
+						},
+					},
+				},
+				Params: &schemas.ResponsesParameters{
+					MaxOutputTokens: &maxTokens,
+					Temperature:     &temp,
+					TopP:            &topP,
+				},
+			},
+		},
+		{
+			name: "InferenceParametersWithStopSequences",
+			input: &bedrock.BedrockConverseRequest{
+				ModelID: "bedrock/claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+				InferenceConfig: &bedrock.BedrockInferenceConfig{
+					MaxTokens:     &maxTokens,
+					Temperature:   &temp,
+					TopP:          &topP,
+					StopSequences: testStop,
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesRequest{
+				Provider: schemas.Bedrock,
+				Model:    "claude-3-sonnet",
+				Input: []schemas.ResponsesMessage{
+					{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role:   schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+						Status: schemas.Ptr("completed"),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesInputMessageContentBlockTypeText,
+									Text: schemas.Ptr("Hello!"),
+								},
+							},
+						},
+					},
+				},
+				Params: &schemas.ResponsesParameters{
+					MaxOutputTokens: &maxTokens,
+					Temperature:     &temp,
+					TopP:            &topP,
+					ExtraParams: map[string]interface{}{
+						"stop": testStop,
+					},
+				},
+			},
+		},
+		{
+			name: "Tools",
+			input: &bedrock.BedrockConverseRequest{
+				ModelID: "bedrock/claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("What's the weather?"),
+							},
+						},
+					},
+				},
+				ToolConfig: &bedrock.BedrockToolConfig{
+					Tools: []bedrock.BedrockTool{
+						{
+							ToolSpec: &bedrock.BedrockToolSpec{
+								Name:        "get_weather",
+								Description: schemas.Ptr("Get weather information"),
+								InputSchema: bedrock.BedrockToolInputSchema{
+									JSON: mustMarshalJSON(map[string]interface{}{
+										"type": "object",
+										"properties": map[string]interface{}{
+											"location": map[string]interface{}{
+												"type":        "string",
+												"description": "The city name",
+											},
+										},
+										"required": []string{"location"},
+									}),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesRequest{
+				Provider: schemas.Bedrock,
+				Model:    "claude-3-sonnet",
+				Input: []schemas.ResponsesMessage{
+					{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role:   schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+						Status: schemas.Ptr("completed"),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesInputMessageContentBlockTypeText,
+									Text: schemas.Ptr("What's the weather?"),
+								},
+							},
+						},
+					},
+				},
+				Params: &schemas.ResponsesParameters{
+					Tools: []schemas.ResponsesTool{
+						{
+							Type:        schemas.ResponsesToolTypeFunction,
+							Name:        schemas.Ptr("get_weather"),
+							Description: schemas.Ptr("Get weather information"),
+							ResponsesToolFunction: &schemas.ResponsesToolFunction{
+								Parameters: &expectedParams,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "AllExtraParams",
+			input: &bedrock.BedrockConverseRequest{
+				ModelID: "bedrock/claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+				GuardrailConfig: &bedrock.BedrockGuardrailConfig{
+					GuardrailIdentifier: "test-guardrail",
+					GuardrailVersion:    "1",
+					Trace:               &trace,
+				},
+				PerformanceConfig: &bedrock.BedrockPerformanceConfig{
+					Latency: &latency,
+				},
+				PromptVariables: map[string]bedrock.BedrockPromptVariable{
+					"username": {
+						Text: schemas.Ptr("John"),
+					},
+				},
+				RequestMetadata: map[string]string{
+					"user": "test-user",
+				},
+				AdditionalModelRequestFields: schemas.NewOrderedMapFromPairs(
+					schemas.KV("customField", "customValue"),
+				),
+				AdditionalModelResponseFieldPaths: []string{"field1", "field2"},
+			},
+			expected: &schemas.DeepIntShieldResponsesRequest{
+				Provider: schemas.Bedrock,
+				Model:    "claude-3-sonnet",
+				Input: []schemas.ResponsesMessage{
+					{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role:   schemas.Ptr(schemas.ResponsesInputMessageRoleUser),
+						Status: schemas.Ptr("completed"),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesInputMessageContentBlockTypeText,
+									Text: schemas.Ptr("Hello!"),
+								},
+							},
+						},
+					},
+				},
+				Params: &schemas.ResponsesParameters{
+					ExtraParams: map[string]interface{}{
+						"guardrailConfig": map[string]interface{}{
+							"guardrailIdentifier": "test-guardrail",
+							"guardrailVersion":    "1",
+							"trace":               trace,
+						},
+						"performanceConfig": map[string]interface{}{
+							"latency": latency,
+						},
+						"promptVariables": map[string]interface{}{
+							"username": map[string]interface{}{
+								"text": "John",
+							},
+						},
+						"requestMetadata": map[string]string{
+							"user": "test-user",
+						},
+						"additionalModelRequestFieldPaths": schemas.NewOrderedMapFromPairs(
+							schemas.KV("customField", "customValue"),
+						),
+						"additionalModelResponseFieldPaths": []string{"field1", "field2"},
+					},
+				},
+			},
+		},
+		{
+			name: "MessageWithToolUse",
+			input: &bedrock.BedrockConverseRequest{
+				ModelID: "bedrock/claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolUse: &bedrock.BedrockToolUse{
+									ToolUseID: "tool-use-123",
+									Name:      "get_weather",
+									Input: json.RawMessage(`{"location":"NYC"}`),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesRequest{
+				Provider: schemas.Bedrock,
+				Model:    "claude-3-sonnet",
+				Input: []schemas.ResponsesMessage{
+					{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+						Status: schemas.Ptr("completed"),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID:    schemas.Ptr("tool-use-123"),
+							Name:      schemas.Ptr("get_weather"),
+							Arguments: schemas.Ptr(`{"location":"NYC"}`),
+						},
+					},
+				},
+				Params: &schemas.ResponsesParameters{},
+			},
+		},
+		{
+			name: "MessageWithToolResult",
+			input: &bedrock.BedrockConverseRequest{
+				ModelID: "bedrock/claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolResult: &bedrock.BedrockToolResult{
+									ToolUseID: "tool-use-123",
+									Content: []bedrock.BedrockContentBlock{
+										{
+											Text: schemas.Ptr("The weather in NYC is sunny, 72°F"),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesRequest{
+				Provider: schemas.Bedrock,
+				Model:    "claude-3-sonnet",
+				Input: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID: schemas.Ptr("tool-use-123"),
+							Output: &schemas.ResponsesToolMessageOutputStruct{
+								ResponsesToolCallOutputStr: schemas.Ptr("The weather in NYC is sunny, 72°F"),
+							},
+						},
+					},
+				},
+				Params: &schemas.ResponsesParameters{},
+			},
+		},
+		{
+			name: "MessageWithBothToolUseAndToolResult",
+			input: &bedrock.BedrockConverseRequest{
+				ModelID: "bedrock/claude-3-sonnet",
+				Messages: []bedrock.BedrockMessage{
+					{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolUse: &bedrock.BedrockToolUse{
+									ToolUseID: "tool-use-456",
+									Name:      "calculate",
+									Input: json.RawMessage(`{"expression":"2+2"}`),
+								},
+							},
+						},
+					},
+					{
+						Role: bedrock.BedrockMessageRoleUser,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolResult: &bedrock.BedrockToolResult{
+									ToolUseID: "tool-use-456",
+									Content: []bedrock.BedrockContentBlock{
+										{
+											Text: schemas.Ptr("4"),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesRequest{
+				Provider: schemas.Bedrock,
+				Model:    "claude-3-sonnet",
+				Input: []schemas.ResponsesMessage{
+					{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+						Status: schemas.Ptr("completed"),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID:    schemas.Ptr("tool-use-456"),
+							Name:      schemas.Ptr("calculate"),
+							Arguments: schemas.Ptr(`{"expression":"2+2"}`),
+						},
+					},
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID: schemas.Ptr("tool-use-456"),
+							Output: &schemas.ResponsesToolMessageOutputStruct{
+								ResponsesToolCallOutputStr: schemas.Ptr("4"),
+							},
+						},
+					},
+				},
+				Params: &schemas.ResponsesParameters{},
+			},
+		},
+		{
+			name:    "NilRequest",
+			input:   nil,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var actual *schemas.DeepIntShieldResponsesRequest
+			var err error
+			if tt.input == nil {
+				var bedrockReq *bedrock.BedrockConverseRequest
+				actual, err = bedrockReq.ToDeepIntShieldResponsesRequest(ctx)
+			} else {
+				actual, err = tt.input.ToDeepIntShieldResponsesRequest(ctx)
+			}
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, actual)
+				if tt.input == nil {
+					assert.Contains(t, err.Error(), "nil")
+				}
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.expected, actual)
+			}
+		})
+	}
+}
+
+// TestDeepIntShieldToBedrockResponseConversion tests the conversion from DeepIntShield Responses response to Bedrock response
+func TestDeepIntShieldToBedrockResponseConversion(t *testing.T) {
+	inputTokens := 10
+	outputTokens := 20
+	totalTokens := 30
+	latency := int64(100)
+	callID := "call-123"
+	toolName := "get_weather"
+	arguments := `{"location":"NYC"}`
+	reason := "max_tokens"
+
+	tests := []struct {
+		name     string
+		input    *schemas.DeepIntShieldResponsesResponse
+		expected *bedrock.BedrockConverseResponse
+		wantErr  bool
+	}{
+		{
+			name: "BasicTextResponse",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeText,
+									Text: schemas.Ptr("Hello, world!"),
+								},
+							},
+						},
+					},
+				},
+				// IncompleteDetails is nil, so should default to "end_turn"
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: "end_turn", // Default stop reason when IncompleteDetails is nil
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello, world!"),
+							},
+						},
+					},
+				},
+				Usage:   &bedrock.BedrockTokenUsage{},
+				Metrics: &bedrock.BedrockConverseMetrics{},
+			},
+		},
+		{
+			name: "ResponseWithUsage",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeText,
+									Text: schemas.Ptr("Hello!"),
+								},
+							},
+						},
+					},
+				},
+				Usage: &schemas.ResponsesResponseUsage{
+					InputTokens:  inputTokens,
+					OutputTokens: outputTokens,
+					TotalTokens:  totalTokens,
+				},
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: "end_turn",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+				Usage: &bedrock.BedrockTokenUsage{
+					InputTokens:  inputTokens,
+					OutputTokens: outputTokens,
+					TotalTokens:  totalTokens,
+				},
+				Metrics: &bedrock.BedrockConverseMetrics{},
+			},
+		},
+		{
+			name: "ResponseWithToolUse",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID:    &callID,
+							Name:      &toolName,
+							Arguments: &arguments,
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: "tool_use",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolUse: &bedrock.BedrockToolUse{
+									ToolUseID: callID,
+									Name:      toolName,
+									Input:     json.RawMessage(`{"location":"NYC"}`),
+								},
+							},
+						},
+					},
+				},
+				Usage:   &bedrock.BedrockTokenUsage{},
+				Metrics: &bedrock.BedrockConverseMetrics{},
+			},
+		},
+		{
+			name: "ResponseWithToolUseInvalidJSON",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID:    &callID,
+							Name:      &toolName,
+							Arguments: schemas.Ptr("invalid json {"),
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: "tool_use",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolUse: &bedrock.BedrockToolUse{
+									ToolUseID: callID,
+									Name:      toolName,
+									Input:     json.RawMessage("invalid json {"), // Should fallback to raw string
+								},
+							},
+						},
+					},
+				},
+				Usage:   &bedrock.BedrockTokenUsage{},
+				Metrics: &bedrock.BedrockConverseMetrics{},
+			},
+		},
+		{
+			name: "ResponseWithToolUseNilArguments",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID:    &callID,
+							Name:      &toolName,
+							Arguments: nil,
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: "tool_use",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolUse: &bedrock.BedrockToolUse{
+									ToolUseID: callID,
+									Name:      toolName,
+									Input:     json.RawMessage("{}"), // Should default to empty map
+								},
+							},
+						},
+					},
+				},
+				Usage:   &bedrock.BedrockTokenUsage{},
+				Metrics: &bedrock.BedrockConverseMetrics{},
+			},
+		},
+		{
+			name: "ResponseWithMetrics",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeText,
+									Text: schemas.Ptr("Hello!"),
+								},
+							},
+						},
+					},
+				},
+				ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+					Latency: latency,
+				},
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: "end_turn",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+				Usage: &bedrock.BedrockTokenUsage{},
+				Metrics: &bedrock.BedrockConverseMetrics{
+					LatencyMs: latency,
+				},
+			},
+		},
+		{
+			name: "ResponseWithIncompleteDetails",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeText,
+									Text: schemas.Ptr("Hello!"),
+								},
+							},
+						},
+					},
+				},
+				IncompleteDetails: &schemas.ResponsesResponseIncompleteDetails{
+					Reason: reason, // This should be used as stop reason instead of default "end_turn"
+				},
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: reason, // Should use IncompleteDetails.Reason when present
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+				Usage:   &bedrock.BedrockTokenUsage{},
+				Metrics: &bedrock.BedrockConverseMetrics{},
+			},
+		},
+		{
+			name: "ResponseWithToolResultString",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID: schemas.Ptr("call-123"),
+							Output: &schemas.ResponsesToolMessageOutputStruct{
+								ResponsesToolCallOutputStr: schemas.Ptr("Tool result text"),
+							},
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: "end_turn",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolResult: &bedrock.BedrockToolResult{
+									ToolUseID: "call-123",
+									Status:    schemas.Ptr("success"),
+									Content: []bedrock.BedrockContentBlock{
+										{
+											Text: schemas.Ptr("Tool result text"),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				Usage:   &bedrock.BedrockTokenUsage{},
+				Metrics: &bedrock.BedrockConverseMetrics{},
+			},
+		},
+		{
+			name: "ResponseWithToolResultJSON",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID: schemas.Ptr("call-456"),
+							Output: &schemas.ResponsesToolMessageOutputStruct{
+								ResponsesToolCallOutputStr: schemas.Ptr(`{"temperature": 72, "location": "NYC"}`),
+							},
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: "end_turn",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolResult: &bedrock.BedrockToolResult{
+									ToolUseID: "call-456",
+									Status:    schemas.Ptr("success"),
+									Content: []bedrock.BedrockContentBlock{
+										{
+											JSON: mustMarshalJSON(map[string]interface{}{
+												"temperature": float64(72),
+												"location":    "NYC",
+											}),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				Usage:   &bedrock.BedrockTokenUsage{},
+				Metrics: &bedrock.BedrockConverseMetrics{},
+			},
+		},
+		{
+			name: "ResponseWithToolResultContentBlocks",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID: schemas.Ptr("call-789"),
+							Output: &schemas.ResponsesToolMessageOutputStruct{
+								ResponsesFunctionToolCallOutputBlocks: []schemas.ResponsesMessageContentBlock{
+									{
+										Type: schemas.ResponsesOutputMessageContentTypeText,
+										Text: schemas.Ptr("Result from tool"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: "end_turn",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolResult: &bedrock.BedrockToolResult{
+									ToolUseID: "call-789",
+									Status:    schemas.Ptr("success"),
+									Content: []bedrock.BedrockContentBlock{
+										{
+											Text: schemas.Ptr("Result from tool"),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				Usage:   &bedrock.BedrockTokenUsage{},
+				Metrics: &bedrock.BedrockConverseMetrics{},
+			},
+		},
+		{
+			name: "ResponseWithToolUseAndToolResult",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID:    schemas.Ptr("call-111"),
+							Name:      schemas.Ptr("get_weather"),
+							Arguments: schemas.Ptr(`{"location": "NYC"}`),
+						},
+					},
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID: schemas.Ptr("call-111"),
+							Output: &schemas.ResponsesToolMessageOutputStruct{
+								ResponsesToolCallOutputStr: schemas.Ptr(`{"temperature": 72}`),
+							},
+						},
+					},
+				},
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: "tool_use",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolUse: &bedrock.BedrockToolUse{
+									ToolUseID: "call-111",
+									Name:      "get_weather",
+									Input: json.RawMessage(`{"location":"NYC"}`),
+								},
+							},
+							{
+								ToolResult: &bedrock.BedrockToolResult{
+									ToolUseID: "call-111",
+									Status:    schemas.Ptr("success"),
+									Content: []bedrock.BedrockContentBlock{
+										{
+											JSON: mustMarshalJSON(map[string]interface{}{
+												"temperature": float64(72),
+											}),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				Usage:   &bedrock.BedrockTokenUsage{},
+				Metrics: &bedrock.BedrockConverseMetrics{},
+			},
+		},
+		{
+			name: "ResponseWithToolUseAndIncompleteDetails",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID:    &callID,
+							Name:      &toolName,
+							Arguments: &arguments,
+						},
+					},
+				},
+				IncompleteDetails: &schemas.ResponsesResponseIncompleteDetails{
+					Reason: reason, // IncompleteDetails should take priority over tool_use
+				},
+			},
+			expected: &bedrock.BedrockConverseResponse{
+				StopReason: reason, // Should use IncompleteDetails.Reason even when tool use is present
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolUse: &bedrock.BedrockToolUse{
+									ToolUseID: callID,
+									Name:      toolName,
+									Input:     json.RawMessage(`{"location":"NYC"}`),
+								},
+							},
+						},
+					},
+				},
+				Usage:   &bedrock.BedrockTokenUsage{},
+				Metrics: &bedrock.BedrockConverseMetrics{},
+			},
+		},
+		{
+			name:    "NilResponse",
+			input:   nil,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual, err := bedrock.ToBedrockConverseResponse(tt.input)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, actual)
+				if tt.input == nil {
+					assert.Contains(t, err.Error(), "nil")
+				}
+			} else {
+				require.NoError(t, err)
+				// Compare structure instead of exact equality since IDs may be generated
+				if tt.expected != nil && actual != nil {
+					assert.Equal(t, tt.expected.StopReason, actual.StopReason)
+					assert.Equal(t, tt.expected.Output.Message.Role, actual.Output.Message.Role)
+					assert.Equal(t, len(tt.expected.Output.Message.Content), len(actual.Output.Message.Content))
+					if tt.expected.Usage != nil {
+						assert.Equal(t, tt.expected.Usage.InputTokens, actual.Usage.InputTokens)
+						assert.Equal(t, tt.expected.Usage.OutputTokens, actual.Usage.OutputTokens)
+						assert.Equal(t, tt.expected.Usage.TotalTokens, actual.Usage.TotalTokens)
+					}
+					if tt.expected.Metrics != nil {
+						assert.Equal(t, tt.expected.Metrics.LatencyMs, actual.Metrics.LatencyMs)
+					}
+				} else {
+					assert.Equal(t, tt.expected, actual)
+				}
+			}
+		})
+	}
+}
+
+// TestBedrockToDeepIntShieldResponseConversion tests the conversion from Bedrock response to DeepIntShield Responses response
+func TestBedrockToDeepIntShieldResponseConversion(t *testing.T) {
+	inputTokens := 10
+	outputTokens := 20
+	totalTokens := 30
+	toolUseID := "call-123"
+	toolName := "get_weather"
+	toolInput := json.RawMessage(`{"location":"NYC"}`)
+	ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+
+	tests := []struct {
+		name     string
+		input    *bedrock.BedrockConverseResponse
+		expected *schemas.DeepIntShieldResponsesResponse
+		wantErr  bool
+	}{
+		{
+			name: "BasicTextResponse",
+			input: &bedrock.BedrockConverseResponse{
+				StopReason: "end_turn",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello, world!"),
+							},
+						},
+					},
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesResponse{
+				Output: []schemas.ResponsesMessage{
+					{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role:   schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Status: schemas.Ptr("completed"),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeText,
+									Text: schemas.Ptr("Hello, world!"),
+									ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
+										Annotations: []schemas.ResponsesOutputMessageContentTextAnnotation{},
+										LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "ResponseWithUsage",
+			input: &bedrock.BedrockConverseResponse{
+				StopReason: "end_turn",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Text: schemas.Ptr("Hello!"),
+							},
+						},
+					},
+				},
+				Usage: &bedrock.BedrockTokenUsage{
+					InputTokens:  inputTokens,
+					OutputTokens: outputTokens,
+					TotalTokens:  totalTokens,
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesResponse{
+				Output: []schemas.ResponsesMessage{
+					{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role:   schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Status: schemas.Ptr("completed"),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeText,
+									Text: schemas.Ptr("Hello!"),
+									ResponsesOutputMessageContentText: &schemas.ResponsesOutputMessageContentText{
+										Annotations: []schemas.ResponsesOutputMessageContentTextAnnotation{},
+										LogProbs:    []schemas.ResponsesOutputMessageContentTextLogProb{},
+									},
+								},
+							},
+						},
+					},
+				},
+				Usage: &schemas.ResponsesResponseUsage{
+					InputTokens:  inputTokens,
+					OutputTokens: outputTokens,
+					TotalTokens:  totalTokens,
+				},
+			},
+		},
+		{
+			name: "ResponseWithToolUse",
+			input: &bedrock.BedrockConverseResponse{
+				StopReason: "end_turn",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								ToolUse: &bedrock.BedrockToolUse{
+									ToolUseID: toolUseID,
+									Name:      toolName,
+									Input:     toolInput,
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesResponse{
+				Output: []schemas.ResponsesMessage{
+					{
+						Type:   schemas.Ptr(schemas.ResponsesMessageTypeFunctionCall),
+						Role:   schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Status: schemas.Ptr("completed"),
+						ResponsesToolMessage: &schemas.ResponsesToolMessage{
+							CallID:    &toolUseID,
+							Name:      &toolName,
+							Arguments: schemas.Ptr(string(toolInput)),
+						},
+					},
+				},
+			},
+		},
+		{
+			name:    "NilResponse",
+			input:   nil,
+			wantErr: true,
+		},
+		{
+			name: "EmptyOutput",
+			input: &bedrock.BedrockConverseResponse{
+				StopReason: "end_turn",
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role:    bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{},
+					},
+				},
+			},
+			expected: &schemas.DeepIntShieldResponsesResponse{
+				Output: nil, // Empty content blocks result in nil output
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var actual *schemas.DeepIntShieldResponsesResponse
+			var err error
+			if tt.input == nil {
+				var bedrockResp *bedrock.BedrockConverseResponse
+				actual, err = bedrockResp.ToDeepIntShieldResponsesResponse(ctx)
+			} else {
+				actual, err = tt.input.ToDeepIntShieldResponsesResponse(ctx)
+			}
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, actual)
+				if tt.input == nil {
+					assert.Contains(t, err.Error(), "nil")
+				}
+			} else {
+				require.NoError(t, err)
+				// Note: CreatedAt and IDs are set at runtime, so compare structure instead
+				if actual != nil {
+					assert.Greater(t, actual.CreatedAt, 0)
+					actual.CreatedAt = tt.expected.CreatedAt
+
+					// For output messages, IDs are generated, so we need to compare by value not identity
+					if len(actual.Output) > 0 && len(tt.expected.Output) > 0 {
+						assert.Equal(t, len(tt.expected.Output), len(actual.Output))
+						for i := range actual.Output {
+							assert.Equal(t, tt.expected.Output[i].Type, actual.Output[i].Type)
+							assert.Equal(t, tt.expected.Output[i].Role, actual.Output[i].Role)
+							assert.Equal(t, tt.expected.Output[i].Status, actual.Output[i].Status)
+							if tt.expected.Output[i].ResponsesToolMessage != nil {
+								assert.NotNil(t, actual.Output[i].ResponsesToolMessage)
+								require.NotNil(t, actual.Output[i].ResponsesToolMessage.Name)
+								require.NotNil(t, actual.Output[i].ResponsesToolMessage.CallID)
+								require.NotNil(t, actual.Output[i].ResponsesToolMessage.Arguments)
+								assert.Equal(t, *tt.expected.Output[i].ResponsesToolMessage.Name, *actual.Output[i].ResponsesToolMessage.Name)
+								assert.Equal(t, *tt.expected.Output[i].ResponsesToolMessage.CallID, *actual.Output[i].ResponsesToolMessage.CallID)
+								assert.Equal(t, *tt.expected.Output[i].ResponsesToolMessage.Arguments, *actual.Output[i].ResponsesToolMessage.Arguments)
+							}
+							if tt.expected.Output[i].Content != nil {
+								assert.Equal(t, tt.expected.Output[i].Content, actual.Output[i].Content)
+							}
+						}
+					}
+
+					// Compare usage if present
+					if tt.expected.Usage != nil {
+						assert.NotNil(t, actual.Usage)
+						assert.Equal(t, tt.expected.Usage.InputTokens, actual.Usage.InputTokens)
+						assert.Equal(t, tt.expected.Usage.OutputTokens, actual.Usage.OutputTokens)
+						assert.Equal(t, tt.expected.Usage.TotalTokens, actual.Usage.TotalTokens)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestToBedrockResponsesRequest_AdditionalFields(t *testing.T) {
+	req := &schemas.DeepIntShieldResponsesRequest{
+		Model: "bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
+		Params: &schemas.ResponsesParameters{
+			ExtraParams: map[string]interface{}{
+				"additionalModelRequestFieldPaths": map[string]interface{}{
+					"top_k": 200,
+				},
+				"additionalModelResponseFieldPaths": []string{
+					"/amazon-bedrock-invocationMetrics/inputTokenCount",
+				},
+			},
+		},
+	}
+
+	ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+	bedrockReq, err := bedrock.ToBedrockResponsesRequest(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, bedrockReq)
+
+	// Convert OrderedMap to map[string]interface{} for comparison
+	expectedFields := map[string]interface{}{"top_k": 200}
+	actualFields := bedrockReq.AdditionalModelRequestFields.ToMap()
+	assert.Equal(t, expectedFields, actualFields)
+	assert.Equal(t, []string{"/amazon-bedrock-invocationMetrics/inputTokenCount"}, bedrockReq.AdditionalModelResponseFieldPaths)
+}
+
+func TestToBedrockResponsesRequest_AdditionalFields_InterfaceSlice(t *testing.T) {
+	req := &schemas.DeepIntShieldResponsesRequest{
+		Model: "bedrock/anthropic.claude-3-sonnet-20240229-v1:0",
+		Params: &schemas.ResponsesParameters{
+			ExtraParams: map[string]interface{}{
+				"additionalModelResponseFieldPaths": []interface{}{
+					"/amazon-bedrock-invocationMetrics/inputTokenCount",
+				},
+			},
+		},
+	}
+
+	ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+	bedrockReq, err := bedrock.ToBedrockResponsesRequest(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, bedrockReq)
+
+	assert.Equal(t, []string{"/amazon-bedrock-invocationMetrics/inputTokenCount"}, bedrockReq.AdditionalModelResponseFieldPaths)
+}
+
+// TestToolResultJSONParsingResponsesAPI tests that tool results are correctly parsed and wrapped based on JSON type
+// Tests only Responses API.
+func TestToolResultJSONParsingResponsesAPI(t *testing.T) {
+	tests := []struct {
+		name                string
+		toolResultContent   string
+		expectedContentType string // "text" or "json"
+		expectedJSON        json.RawMessage
+		expectedText        *string
+	}{
+		{
+			name:                "PlainTextResult",
+			toolResultContent:   "Hello there! This is plain text, not JSON.",
+			expectedContentType: "text",
+			expectedText:        schemas.Ptr("Hello there! This is plain text, not JSON."),
+		},
+		{
+			name:                "InvalidJSONResult",
+			toolResultContent:   "{invalid json syntax",
+			expectedContentType: "text",
+			expectedText:        schemas.Ptr("{invalid json syntax"),
+		},
+		{
+			name:                "JSONObjectResult",
+			toolResultContent:   `{"location":"NYC","temperature":72}`,
+			expectedContentType: "json",
+			expectedJSON: mustMarshalJSON(map[string]any{"location": "NYC", "temperature": float64(72)}),
+		},
+		{
+			name:                "JSONArrayResult",
+			toolResultContent:   `[{"period":"now","weather":"sunny"},{"period":"next_1_hour","weather":"cloudy"}]`,
+			expectedContentType: "json",
+			expectedJSON: mustMarshalJSON(map[string]any{
+				"results": []any{
+					map[string]any{"period": "now", "weather": "sunny"},
+					map[string]any{"period": "next_1_hour", "weather": "cloudy"},
+				},
+			}),
+		},
+		{
+			name:                "JSONPrimitiveNumberResult",
+			toolResultContent:   `42`,
+			expectedContentType: "json",
+			expectedJSON: mustMarshalJSON(map[string]any{"value": float64(42)}),
+		},
+		{
+			name:                "JSONPrimitiveStringResult",
+			toolResultContent:   `"hello world"`,
+			expectedContentType: "json",
+			expectedJSON: mustMarshalJSON(map[string]any{"value": "hello world"}),
+		},
+		{
+			name:                "JSONPrimitiveBooleanResult",
+			toolResultContent:   `true`,
+			expectedContentType: "json",
+			expectedJSON: mustMarshalJSON(map[string]any{"value": true}),
+		},
+		{
+			name:                "JSONPrimitiveNullResult",
+			toolResultContent:   `null`,
+			expectedContentType: "json",
+			expectedJSON: mustMarshalJSON(map[string]any{"value": nil}),
+		},
+		{
+			name:                "EmptyJSONObjectResult",
+			toolResultContent:   `{}`,
+			expectedContentType: "json",
+			expectedJSON: mustMarshalJSON(map[string]any{}),
+		},
+		{
+			name:                "EmptyJSONArrayResult",
+			toolResultContent:   `[]`,
+			expectedContentType: "json",
+			expectedJSON: mustMarshalJSON(map[string]any{"results": []any{}}),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a Responses API message with function call output (tool result)
+			input := []schemas.ResponsesMessage{
+				{
+					Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+					ResponsesToolMessage: &schemas.ResponsesToolMessage{
+						CallID: schemas.Ptr("tooluse_test_123"),
+						Output: &schemas.ResponsesToolMessageOutputStruct{
+							ResponsesToolCallOutputStr: schemas.Ptr(tt.toolResultContent),
+						},
+					},
+				},
+			}
+
+			messages, _, err := bedrock.ConvertDeepIntShieldMessagesToBedrockMessages(input)
+			require.NoError(t, err)
+			require.Len(t, messages, 1)
+
+			// The tool result should be in a user message
+			toolResultMsg := messages[0]
+			assert.Equal(t, bedrock.BedrockMessageRoleUser, toolResultMsg.Role)
+			require.Len(t, toolResultMsg.Content, 1)
+
+			toolResult := toolResultMsg.Content[0].ToolResult
+			require.NotNil(t, toolResult)
+			assert.Equal(t, "tooluse_test_123", toolResult.ToolUseID)
+			require.Len(t, toolResult.Content, 1)
+
+			resultContent := toolResult.Content[0]
+			if tt.expectedContentType == "text" {
+				assert.NotNil(t, resultContent.Text, "Expected text content")
+				assert.Nil(t, resultContent.JSON, "Expected no JSON content")
+				assert.Equal(t, tt.expectedText, resultContent.Text)
+			} else {
+				assert.Nil(t, resultContent.Text, "Expected no text content")
+				assert.Equal(t, tt.expectedJSON, resultContent.JSON)
+			}
+		})
+	}
+}
+
+// TestConvertDeepIntShieldResponsesMessageContentBlocksToBedrockContentBlocks_EmptyBlocks tests that
+// empty ContentBlocks are not created when required fields are missing, preventing the Bedrock API error:
+// "ContentBlock object at messages.1.content.0 must set one of the following keys: text, image, toolUse, toolResult, document, video, cachePoint, reasoningContent, citationsContent, searchResult."
+func TestConvertDeepIntShieldResponsesMessageContentBlocksToBedrockContentBlocks_EmptyBlocks(t *testing.T) {
+	tests := []struct {
+		name           string
+		input          *schemas.DeepIntShieldResponsesResponse
+		expectedBlocks int // Expected number of ContentBlocks in the output
+		description    string
+	}{
+		{
+			name: "ImageBlockWithNilImageURL_ShouldNotCreateEmptyBlock",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesInputMessageContentBlockTypeImage,
+									ResponsesInputMessageContentBlockImage: &schemas.ResponsesInputMessageContentBlockImage{
+										ImageURL: nil, // Missing ImageURL - should not create empty block
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBlocks: 0,
+			description:    "Image block with nil ImageURL should not create an empty ContentBlock",
+		},
+		{
+			name: "ImageBlockWithNilImageBlock_ShouldNotCreateEmptyBlock",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type:                                   schemas.ResponsesInputMessageContentBlockTypeImage,
+									ResponsesInputMessageContentBlockImage: nil, // Missing image block - should not create empty block
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBlocks: 0,
+			description:    "Image block with nil ResponsesInputMessageContentBlockImage should not create an empty ContentBlock",
+		},
+		{
+			name: "ReasoningBlockWithNilText_ShouldNotCreateEmptyBlock",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeReasoning,
+									Text: nil, // Missing Text - should not create empty block
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBlocks: 0,
+			description:    "Reasoning block with nil Text should not create an empty ContentBlock",
+		},
+		{
+			name: "FileBlockWithNilFileData_ShouldNotCreateEmptyBlock",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesInputMessageContentBlockTypeFile,
+									ResponsesInputMessageContentBlockFile: &schemas.ResponsesInputMessageContentBlockFile{
+										FileData: nil, // Missing FileData - should not create empty block
+										Filename: schemas.Ptr("test.pdf"),
+										FileType: schemas.Ptr("application/pdf"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBlocks: 0,
+			description:    "File block with nil FileData should not create an empty ContentBlock",
+		},
+		{
+			name: "FileBlockWithNilFileBlock_ShouldNotCreateEmptyBlock",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type:                                  schemas.ResponsesInputMessageContentBlockTypeFile,
+									ResponsesInputMessageContentBlockFile: nil, // Missing file block - should not create empty block
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBlocks: 0,
+			description:    "File block with nil ResponsesInputMessageContentBlockFile should not create an empty ContentBlock",
+		},
+		{
+			name: "ValidTextBlock_ShouldCreateBlock",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeText,
+									Text: schemas.Ptr("Valid text content"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBlocks: 1,
+			description:    "Valid text block should create a ContentBlock",
+		},
+		{
+			name: "ValidReasoningBlock_ShouldCreateBlock",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeReasoning,
+									Text: schemas.Ptr("Valid reasoning content"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBlocks: 1,
+			description:    "Valid reasoning block should create a ContentBlock",
+		},
+		{
+			name: "ValidFileBlock_ShouldCreateBlock",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesInputMessageContentBlockTypeFile,
+									ResponsesInputMessageContentBlockFile: &schemas.ResponsesInputMessageContentBlockFile{
+										FileData: schemas.Ptr("dGVzdCBmaWxlIGRhdGE="), // base64 encoded "test file data"
+										Filename: schemas.Ptr("test.pdf"),
+										FileType: schemas.Ptr("application/pdf"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBlocks: 1,
+			description:    "Valid file block should create a ContentBlock",
+		},
+		{
+			name: "MixedValidAndInvalidBlocks_ShouldOnlyCreateValidBlocks",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeText,
+									Text: schemas.Ptr("Valid text"),
+								},
+								{
+									Type:                                   schemas.ResponsesInputMessageContentBlockTypeImage,
+									ResponsesInputMessageContentBlockImage: nil, // Invalid - should be skipped
+								},
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeReasoning,
+									Text: schemas.Ptr("Valid reasoning"),
+								},
+								{
+									Type: schemas.ResponsesInputMessageContentBlockTypeFile,
+									ResponsesInputMessageContentBlockFile: &schemas.ResponsesInputMessageContentBlockFile{
+										FileData: nil, // Invalid - should be skipped
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBlocks: 2, // Only valid text and reasoning blocks
+			description:    "Mixed valid and invalid blocks should only create valid ContentBlocks",
+		},
+		{
+			name: "CacheControlBlock_ShouldCreateCachePointBlock",
+			input: &schemas.DeepIntShieldResponsesResponse{
+				CreatedAt: 1234567890,
+				Output: []schemas.ResponsesMessage{
+					{
+						Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type: schemas.ResponsesOutputMessageContentTypeText,
+									Text: schemas.Ptr("Text with cache control"),
+									CacheControl: &schemas.CacheControl{
+										Type: schemas.CacheControlTypeEphemeral,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedBlocks: 2, // Text block + CachePoint block
+			description:    "ContentBlock with CacheControl should create both content and CachePoint blocks",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual, err := bedrock.ToBedrockConverseResponse(tt.input)
+			require.NoError(t, err, "Conversion should not error")
+			require.NotNil(t, actual, "Response should not be nil")
+			require.NotNil(t, actual.Output, "Output should not be nil")
+			require.NotNil(t, actual.Output.Message, "Message should not be nil")
+
+			actualBlocks := len(actual.Output.Message.Content)
+			assert.Equal(t, tt.expectedBlocks, actualBlocks, tt.description)
+
+			// Verify that all created blocks have at least one required field set
+			for i, block := range actual.Output.Message.Content {
+				hasRequiredField := block.Text != nil ||
+					block.Image != nil ||
+					block.Document != nil ||
+					block.ToolUse != nil ||
+					block.ToolResult != nil ||
+					block.ReasoningContent != nil ||
+					block.CachePoint != nil ||
+					block.JSON != nil ||
+					block.GuardContent != nil
+
+				assert.True(t, hasRequiredField,
+					"ContentBlock at index %d must have at least one required field set (text, image, toolUse, toolResult, document, video, cachePoint, reasoningContent, citationsContent, searchResult)",
+					i)
+			}
+		})
+	}
+}
+
+// TestToolResultDeduplication tests that duplicate tool results are properly handled
+func TestToolResultDeduplication(t *testing.T) {
+	t.Run("DuplicateResultInPendingResults", func(t *testing.T) {
+		manager := bedrock.NewToolCallStateManager()
+
+		// tool call and result
+		manager.RegisterToolCall("call-123", "get_weather", `{"location":"NYC"}`, nil)
+		content1 := []bedrock.BedrockContentBlock{{Text: schemas.Ptr("First result")}}
+		manager.RegisterToolResult("call-123", content1, "success", nil)
+
+		// duplicate result with different content
+		content2 := []bedrock.BedrockContentBlock{{Text: schemas.Ptr("Duplicate result")}}
+		manager.RegisterToolResult("call-123", content2, "success", nil)
+
+		// Deduplicated regardless of content. Practically same ID should not ever has diff content.
+		results := manager.GetPendingResults()
+		require.Len(t, results, 1)
+		require.NotNil(t, results["call-123"])
+		assert.Equal(t, "First result", *results["call-123"].Content[0].Text)
+	})
+
+	t.Run("DuplicateResultAfterEmission", func(t *testing.T) {
+		manager := bedrock.NewToolCallStateManager()
+
+		// Register and emit a tool call
+		manager.RegisterToolCall("call-456", "calculate", `{"x":1,"y":2}`, nil)
+		callIDs := manager.EmitPendingToolCalls()
+		require.Len(t, callIDs, 1)
+		manager.MarkToolCallsEmitted(callIDs, 0)
+
+		// register and emit the result
+		content1 := []bedrock.BedrockContentBlock{{Text: schemas.Ptr("3")}}
+		manager.RegisterToolResult("call-456", content1, "success", nil)
+		manager.MarkResultsEmitted([]string{"call-456"})
+
+		// Register a duplicate
+		content2 := []bedrock.BedrockContentBlock{{Text: schemas.Ptr("Duplicate")}}
+		manager.RegisterToolResult("call-456", content2, "success", nil)
+
+		// Not added due to it being duplicated with the emitted result
+		results := manager.GetPendingResults()
+		assert.Empty(t, results)
+	})
+
+	t.Run("MultipleToolCallsWithDuplicateResults", func(t *testing.T) {
+		manager := bedrock.NewToolCallStateManager()
+
+		// Register multiple tool calls
+		manager.RegisterToolCall("call-a", "tool_a", `{}`, nil)
+		manager.RegisterToolCall("call-b", "tool_b", `{}`, nil)
+
+		// Register results for both
+		contentA := []bedrock.BedrockContentBlock{{Text: schemas.Ptr("Result A")}}
+		contentB := []bedrock.BedrockContentBlock{{Text: schemas.Ptr("Result B")}}
+		manager.RegisterToolResult("call-a", contentA, "success", nil)
+		manager.RegisterToolResult("call-b", contentB, "success", nil)
+
+		// Try to register duplicates
+		contentADup := []bedrock.BedrockContentBlock{{Text: schemas.Ptr("Result A")}}
+		contentBDup := []bedrock.BedrockContentBlock{{Text: schemas.Ptr("Result B")}}
+		manager.RegisterToolResult("call-a", contentADup, "success", nil)
+		manager.RegisterToolResult("call-b", contentBDup, "success", nil)
+
+		// Verify original results are preserved
+		results := manager.GetPendingResults()
+		require.Len(t, results, 2)
+		assert.Equal(t, "Result A", *results["call-a"].Content[0].Text)
+		assert.Equal(t, "Result B", *results["call-b"].Content[0].Text)
+	})
+}
+
+// TestToolCallDeduplication tests that duplicate tool calls are properly handled
+func TestToolCallDeduplication(t *testing.T) {
+	t.Run("DuplicateToolCallIgnored", func(t *testing.T) {
+		manager := bedrock.NewToolCallStateManager()
+
+		manager.RegisterToolCall("call-123", "get_weather", `{"location":"NYC"}`, nil)
+		manager.RegisterToolCall("call-123", "get_weather", `{"location":"NYC"}`, nil)
+
+		// Deduplicated regardless of content.
+		callIDs := manager.EmitPendingToolCalls()
+		require.Len(t, callIDs, 1)
+		assert.Equal(t, "call-123", callIDs[0])
+	})
+
+	t.Run("MultipleDistinctToolCalls", func(t *testing.T) {
+		manager := bedrock.NewToolCallStateManager()
+
+		// initial registration
+		manager.RegisterToolCall("call-a", "tool_a", `{"x":1}`, nil)
+		manager.RegisterToolCall("call-b", "tool_b", `{"y":2}`, nil)
+		manager.RegisterToolCall("call-c", "tool_c", `{"z":3}`, nil)
+
+		// duplications
+		manager.RegisterToolCall("call-a", "tool_a", `{"x":1}`, nil)
+		manager.RegisterToolCall("call-b", "tool_b", `{"y":2}`, nil)
+		manager.RegisterToolCall("call-c", "tool_c", `{"z":3}`, nil)
+
+		// no duplicates
+		callIDs := manager.EmitPendingToolCalls()
+		require.Len(t, callIDs, 3)
+		assert.Contains(t, callIDs, "call-a")
+		assert.Contains(t, callIDs, "call-b")
+		assert.Contains(t, callIDs, "call-c")
+	})
+
+	t.Run("DuplicateToolCallAfterEmission", func(t *testing.T) {
+		manager := bedrock.NewToolCallStateManager()
+
+		// register and emit a tool call
+		manager.RegisterToolCall("call-789", "calculator", `{"expr":"1+1"}`, nil)
+		callIDs := manager.EmitPendingToolCalls()
+		require.Len(t, callIDs, 1)
+		manager.MarkToolCallsEmitted(callIDs, 0)
+
+		// register the same tool call again after emission
+		manager.RegisterToolCall("call-789", "calculator", `{"expr":"1+1"}`, nil)
+
+		// duplicate was rejected
+		newCallIDs := manager.EmitPendingToolCalls()
+		assert.Empty(t, newCallIDs)
+	})
+}
+
+// TestAnthropicReasoningConfigUsesThinkinField verifies that Anthropic models use
+// the "thinking" field (not "reasoning_config") in additionalModelRequestFields
+// for the Bedrock Converse API.
+func TestAnthropicReasoningConfigUsesThinkingField(t *testing.T) {
+	tests := []struct {
+		name                     string
+		model                    string
+		effort                   *string
+		maxTokens                *int
+		expectedFieldName        string
+		expectedType             string
+		expectBudgetTokens       bool
+		expectNoOutputConfig     bool
+		expectOutputConfigEffort string // expected effort value in output_config (empty string means no output_config expected)
+	}{
+		{
+			name:                     "Opus4.6_AdaptiveThinking_UsesThinkingField",
+			model:                    "anthropic.claude-opus-4-6-v1",
+			effort:                   schemas.Ptr("high"),
+			expectedFieldName:        "thinking",
+			expectedType:             "adaptive",
+			expectBudgetTokens:       false,
+			expectNoOutputConfig:     false,
+			expectOutputConfigEffort: "high",
+		},
+		{
+			name:                 "Opus4.5_NativeEffort_UsesThinkingField",
+			model:                "anthropic.claude-opus-4-5-v1",
+			effort:               schemas.Ptr("high"),
+			expectedFieldName:    "thinking",
+			expectedType:         "enabled",
+			expectBudgetTokens:   true,
+			expectNoOutputConfig: true,
+		},
+		{
+			name:                 "Sonnet3.7_OlderModel_UsesThinkingField",
+			model:                "anthropic.claude-3-7-sonnet-v1",
+			effort:               schemas.Ptr("medium"),
+			expectedFieldName:    "thinking",
+			expectedType:         "enabled",
+			expectBudgetTokens:   true,
+			expectNoOutputConfig: true,
+		},
+		{
+			name:                 "Anthropic_MaxTokens_UsesThinkingField",
+			model:                "anthropic.claude-3-7-sonnet-v1",
+			maxTokens:            schemas.Ptr(2048),
+			expectedFieldName:    "thinking",
+			expectedType:         "enabled",
+			expectBudgetTokens:   true,
+			expectNoOutputConfig: true,
+		},
+		{
+			name:                 "Anthropic_DisabledReasoning_UsesThinkingField",
+			model:                "anthropic.claude-3-7-sonnet-v1",
+			effort:               schemas.Ptr("none"),
+			expectedFieldName:    "thinking",
+			expectedType:         "disabled",
+			expectBudgetTokens:   false,
+			expectNoOutputConfig: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reasoning := &schemas.ChatReasoning{}
+			if tt.effort != nil {
+				reasoning.Effort = tt.effort
+			}
+			if tt.maxTokens != nil {
+				reasoning.MaxTokens = tt.maxTokens
+			}
+
+			deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+				Model: tt.model,
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentStr: schemas.Ptr("Hello"),
+						},
+					},
+				},
+				Params: &schemas.ChatParameters{
+					Reasoning: reasoning,
+				},
+			}
+
+			ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+			result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.NotNil(t, result.AdditionalModelRequestFields)
+
+			// Verify the correct field name is used
+			thinkingConfig, hasThinking := result.AdditionalModelRequestFields.Get(tt.expectedFieldName)
+			assert.True(t, hasThinking, "expected field %q in AdditionalModelRequestFields", tt.expectedFieldName)
+
+			// Verify reasoning_config is NOT used for Anthropic models
+			_, hasReasoningConfig := result.AdditionalModelRequestFields.Get("reasoning_config")
+			assert.False(t, hasReasoningConfig, "reasoning_config should NOT be set for Anthropic models")
+
+			// Verify output_config handling
+			if tt.expectNoOutputConfig {
+				_, hasOutputConfig := result.AdditionalModelRequestFields.Get("output_config")
+				assert.False(t, hasOutputConfig, "output_config should NOT be set for this model")
+			} else if tt.expectOutputConfigEffort != "" {
+				// Opus 4.6+ should have output_config.effort set
+				outputConfig, hasOutputConfig := result.AdditionalModelRequestFields.Get("output_config")
+				assert.True(t, hasOutputConfig, "output_config should be set for Opus 4.6+")
+				if outputConfigMap, ok := outputConfig.(map[string]any); ok {
+					effortStr, _ := outputConfigMap["effort"].(string)
+					assert.Equal(t, tt.expectOutputConfigEffort, effortStr, "output_config.effort should match expected value")
+				}
+			}
+
+			// Verify the type
+			if configMap, ok := thinkingConfig.(map[string]any); ok {
+				typeStr, _ := configMap["type"].(string)
+				assert.Equal(t, tt.expectedType, typeStr)
+
+				if tt.expectBudgetTokens {
+					_, hasBudget := configMap["budget_tokens"]
+					assert.True(t, hasBudget, "expected budget_tokens in thinking config")
+				}
+			} else if configMap, ok := thinkingConfig.(map[string]string); ok {
+				assert.Equal(t, tt.expectedType, configMap["type"])
+			}
+		})
+	}
+}
+
+// TestNovaReasoningConfigUsesReasoningConfigField verifies that Nova models use
+// the "reasoningConfig" field (camelCase) and NOT "thinking".
+func TestNovaReasoningConfigUsesReasoningConfigField(t *testing.T) {
+	deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+		Model: "amazon.nova-pro-v1",
+		Input: []schemas.ChatMessage{
+			{
+				Role: schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{
+					ContentStr: schemas.Ptr("Hello"),
+				},
+			},
+		},
+		Params: &schemas.ChatParameters{
+			Reasoning: &schemas.ChatReasoning{
+				Effort: schemas.Ptr("medium"),
+			},
+		},
+	}
+
+	ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+	result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.AdditionalModelRequestFields)
+
+	// Nova should use reasoningConfig (camelCase)
+	_, hasReasoningConfig := result.AdditionalModelRequestFields.Get("reasoningConfig")
+	assert.True(t, hasReasoningConfig, "Nova models should use reasoningConfig field")
+
+	// Nova should NOT use "thinking"
+	_, hasThinking := result.AdditionalModelRequestFields.Get("thinking")
+	assert.False(t, hasThinking, "Nova models should NOT use thinking field")
+}
+
+// TestStandaloneCachePointBlockHandling tests that standalone cachePoint content blocks
+// (those with only cachePoint field and no type) are properly converted.
+func TestStandaloneCachePointBlockHandling(t *testing.T) {
+	t.Run("UserMessage_WithStandaloneCachePoint", func(t *testing.T) {
+		deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+			Model: "anthropic.claude-3-sonnet-20240229-v1:0",
+			Input: []schemas.ChatMessage{
+				{
+					Role: schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{
+						ContentBlocks: []schemas.ChatContentBlock{
+							{
+								Type: schemas.ChatContentBlockTypeText,
+								Text: schemas.Ptr("Hello, this is a test message"),
+							},
+							{
+								// Standalone cachePoint block (no type, just cachePoint)
+								CachePoint: &schemas.CachePoint{
+									Type: "default",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+		result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.Len(t, result.Messages, 1)
+		require.Len(t, result.Messages[0].Content, 2)
+
+		// First block should be text
+		assert.NotNil(t, result.Messages[0].Content[0].Text)
+		assert.Equal(t, "Hello, this is a test message", *result.Messages[0].Content[0].Text)
+
+		// Second block should be cachePoint
+		assert.NotNil(t, result.Messages[0].Content[1].CachePoint)
+		assert.Equal(t, bedrock.BedrockCachePointTypeDefault, result.Messages[0].Content[1].CachePoint.Type)
+	})
+
+	t.Run("BedrockNativeFormat_TextWithoutType", func(t *testing.T) {
+		// This tests the Bedrock native format where text blocks don't have a "type" field
+		// Example: {"text": "hello"} instead of {"type": "text", "text": "hello"}
+		deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+			Model: "anthropic.claude-3-sonnet-20240229-v1:0",
+			Input: []schemas.ChatMessage{
+				{
+					Role: schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{
+						ContentBlocks: []schemas.ChatContentBlock{
+							{
+								// No Type field set, but Text is present (Bedrock native format)
+								Text: schemas.Ptr("hello this is a test request"),
+							},
+							{
+								// Standalone cachePoint block
+								CachePoint: &schemas.CachePoint{
+									Type: "default",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+		result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.Len(t, result.Messages, 1)
+		require.Len(t, result.Messages[0].Content, 2)
+
+		// First block should be text (even without explicit type)
+		assert.NotNil(t, result.Messages[0].Content[0].Text)
+		assert.Equal(t, "hello this is a test request", *result.Messages[0].Content[0].Text)
+
+		// Second block should be cachePoint
+		assert.NotNil(t, result.Messages[0].Content[1].CachePoint)
+		assert.Equal(t, bedrock.BedrockCachePointTypeDefault, result.Messages[0].Content[1].CachePoint.Type)
+	})
+
+	t.Run("SystemMessage_WithStandaloneCachePoint", func(t *testing.T) {
+		deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+			Model: "anthropic.claude-3-sonnet-20240229-v1:0",
+			Input: []schemas.ChatMessage{
+				{
+					Role: schemas.ChatMessageRoleSystem,
+					Content: &schemas.ChatMessageContent{
+						ContentBlocks: []schemas.ChatContentBlock{
+							{
+								Type: schemas.ChatContentBlockTypeText,
+								Text: schemas.Ptr("You are a helpful assistant"),
+							},
+							{
+								// Standalone cachePoint block
+								CachePoint: &schemas.CachePoint{
+									Type: "default",
+								},
+							},
+							{
+								Type: schemas.ChatContentBlockTypeText,
+								Text: schemas.Ptr("Additional system instructions"),
+							},
+						},
+					},
+				},
+				{
+					Role: schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: schemas.Ptr("Hello"),
+					},
+				},
+			},
+		}
+
+		ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+		result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.NotNil(t, result.System)
+		require.Len(t, result.System, 3) // Two text blocks + one cachePoint
+
+		// First system message should be text
+		assert.NotNil(t, result.System[0].Text)
+		assert.Equal(t, "You are a helpful assistant", *result.System[0].Text)
+
+		// Second should be cachePoint
+		assert.NotNil(t, result.System[1].CachePoint)
+
+		// Third should be text
+		assert.NotNil(t, result.System[2].Text)
+		assert.Equal(t, "Additional system instructions", *result.System[2].Text)
+	})
+}
+
+func TestMultiTurnReasoningContentPassthrough(t *testing.T) {
+	t.Parallel()
+
+	t.Run("AssistantMessage_WithReasoningDetails_ConvertsToBedrockReasoningContent", func(t *testing.T) {
+		reasoningText := "Let me think step by step..."
+		signature := "abc123signature"
+		assistantContent := "The answer is 42."
+
+		deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+			Provider: schemas.Bedrock,
+			Model:    "anthropic.claude-opus-4-6-v1",
+			Input: []schemas.ChatMessage{
+				{
+					Role: schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: schemas.Ptr("What is the meaning of life?"),
+					},
+				},
+				{
+					Role: schemas.ChatMessageRoleAssistant,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: &assistantContent,
+					},
+					ChatAssistantMessage: &schemas.ChatAssistantMessage{
+						ReasoningDetails: []schemas.ChatReasoningDetails{
+							{
+								Index:     0,
+								Type:      schemas.DeepIntShieldReasoningDetailsTypeText,
+								Text:      &reasoningText,
+								Signature: &signature,
+							},
+						},
+					},
+				},
+				{
+					Role: schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: schemas.Ptr("Can you elaborate?"),
+					},
+				},
+			},
+		}
+
+		ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+		result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+
+		// The assistant message (index 1) should have reasoning content blocks
+		require.Len(t, result.Messages, 3) // user, assistant, user
+		assistantMsg := result.Messages[1]
+		assert.Equal(t, bedrock.BedrockMessageRoleAssistant, assistantMsg.Role)
+
+		// Should have text block + reasoning content block
+		require.GreaterOrEqual(t, len(assistantMsg.Content), 2)
+
+		// Find the reasoning content block
+		var foundReasoning bool
+		for _, block := range assistantMsg.Content {
+			if block.ReasoningContent != nil {
+				foundReasoning = true
+				require.NotNil(t, block.ReasoningContent.ReasoningText)
+				assert.Equal(t, &reasoningText, block.ReasoningContent.ReasoningText.Text)
+				assert.Equal(t, &signature, block.ReasoningContent.ReasoningText.Signature)
+			}
+		}
+		assert.True(t, foundReasoning, "Expected reasoning content block in assistant message")
+	})
+
+	t.Run("AssistantMessage_WithoutReasoningDetails_NoReasoningContent", func(t *testing.T) {
+		assistantContent := "Simple response"
+
+		deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+			Provider: schemas.Bedrock,
+			Model:    "anthropic.claude-opus-4-6-v1",
+			Input: []schemas.ChatMessage{
+				{
+					Role: schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: schemas.Ptr("Hello"),
+					},
+				},
+				{
+					Role: schemas.ChatMessageRoleAssistant,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: &assistantContent,
+					},
+				},
+				{
+					Role: schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: schemas.Ptr("Hi again"),
+					},
+				},
+			},
+		}
+
+		ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+		result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+
+		assistantMsg := result.Messages[1]
+		for _, block := range assistantMsg.Content {
+			assert.Nil(t, block.ReasoningContent, "Should not have reasoning content without ReasoningDetails")
+		}
+	})
+}
+
+func TestDocumentFormatMapping(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		fileType       string
+		expectedFormat string
+	}{
+		{"PDF_MimeType", "application/pdf", "pdf"},
+		{"PDF_Short", "pdf", "pdf"},
+		{"TXT_MimeType", "text/plain", "txt"},
+		{"TXT_Short", "txt", "txt"},
+		{"Markdown_MimeType", "text/markdown", "md"},
+		{"Markdown_Short", "md", "md"},
+		{"HTML_MimeType", "text/html", "html"},
+		{"HTML_Short", "html", "html"},
+		{"CSV_MimeType", "text/csv", "csv"},
+		{"CSV_Short", "csv", "csv"},
+		{"DOC_MimeType", "application/msword", "doc"},
+		{"DOC_Short", "doc", "doc"},
+		{"DOCX_MimeType", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"},
+		{"DOCX_Short", "docx", "docx"},
+		{"XLS_MimeType", "application/vnd.ms-excel", "xls"},
+		{"XLS_Short", "xls", "xls"},
+		{"XLSX_MimeType", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"},
+		{"XLSX_Short", "xlsx", "xlsx"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fileData := "Hello World" // plain text; base64 requires a data: URL prefix
+			deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+				Provider: schemas.Bedrock,
+				Model:    "anthropic.claude-3-5-sonnet-v2",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentBlocks: []schemas.ChatContentBlock{
+								{
+									Type: schemas.ChatContentBlockTypeFile,
+									File: &schemas.ChatInputFile{
+										Filename: schemas.Ptr("testfile"),
+										FileType: &tt.fileType,
+										FileData: &fileData,
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+			result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Len(t, result.Messages, 1)
+			require.Len(t, result.Messages[0].Content, 1)
+			require.NotNil(t, result.Messages[0].Content[0].Document)
+			assert.Equal(t, tt.expectedFormat, result.Messages[0].Content[0].Document.Format,
+				"File type %q should map to format %q", tt.fileType, tt.expectedFormat)
+		})
+	}
+}
+
+func TestBedrockStopReasonMapping(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		bedrockStopReason string
+		expectedDeepIntShield   string
+	}{
+		{"EndTurn", "end_turn", "stop"},
+		{"MaxTokens", "max_tokens", "length"},
+		{"StopSequence", "stop_sequence", "stop"},
+		{"ToolUse", "tool_use", "tool_calls"},
+		{"GuardrailIntervened", "guardrail_intervened", "content_filter"},
+		{"ContentFiltered", "content_filtered", "content_filter"},
+		{"UnknownReason", "some_unknown_reason", "stop"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := &bedrock.BedrockConverseResponse{
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{Text: schemas.Ptr("Response text")},
+						},
+					},
+				},
+				StopReason: tt.bedrockStopReason,
+				Usage: &bedrock.BedrockTokenUsage{
+					InputTokens:  10,
+					OutputTokens: 5,
+					TotalTokens:  15,
+				},
+			}
+
+			deepintshieldResp, err := response.ToDeepIntShieldChatResponse(context.Background(), "test-model")
+			require.NoError(t, err)
+			require.NotNil(t, deepintshieldResp)
+			require.Len(t, deepintshieldResp.Choices, 1)
+			require.NotNil(t, deepintshieldResp.Choices[0].FinishReason)
+			assert.Equal(t, tt.expectedDeepIntShield, *deepintshieldResp.Choices[0].FinishReason,
+				"Bedrock stop reason %q should map to %q", tt.bedrockStopReason, tt.expectedDeepIntShield)
+		})
+	}
+}
+
+func TestGuardrailConfigStreamProcessingMode(t *testing.T) {
+	t.Parallel()
+
+	t.Run("WithStreamProcessingMode", func(t *testing.T) {
+		mode := "async"
+		deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+			Provider: schemas.Bedrock,
+			Model:    "anthropic.claude-3-5-sonnet-v2",
+			Input: []schemas.ChatMessage{
+				{
+					Role: schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: schemas.Ptr("Hello"),
+					},
+				},
+			},
+			Params: &schemas.ChatParameters{
+				ExtraParams: map[string]interface{}{
+					"guardrailConfig": map[string]interface{}{
+						"guardrailIdentifier":  "test-guardrail",
+						"guardrailVersion":     "1",
+						"trace":                "enabled",
+						"streamProcessingMode": mode,
+					},
+				},
+			},
+		}
+
+		ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+		result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.NotNil(t, result.GuardrailConfig)
+		assert.Equal(t, "test-guardrail", result.GuardrailConfig.GuardrailIdentifier)
+		assert.Equal(t, "1", result.GuardrailConfig.GuardrailVersion)
+		require.NotNil(t, result.GuardrailConfig.Trace)
+		assert.Equal(t, "enabled", *result.GuardrailConfig.Trace)
+		require.NotNil(t, result.GuardrailConfig.StreamProcessingMode)
+		assert.Equal(t, mode, *result.GuardrailConfig.StreamProcessingMode)
+	})
+
+	t.Run("WithoutStreamProcessingMode", func(t *testing.T) {
+		deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+			Provider: schemas.Bedrock,
+			Model:    "anthropic.claude-3-5-sonnet-v2",
+			Input: []schemas.ChatMessage{
+				{
+					Role: schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: schemas.Ptr("Hello"),
+					},
+				},
+			},
+			Params: &schemas.ChatParameters{
+				ExtraParams: map[string]interface{}{
+					"guardrailConfig": map[string]interface{}{
+						"guardrailIdentifier": "test-guardrail",
+						"guardrailVersion":    "1",
+					},
+				},
+			},
+		}
+
+		ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+		result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.NotNil(t, result.GuardrailConfig)
+		assert.Nil(t, result.GuardrailConfig.StreamProcessingMode)
+	})
+}
+
+func TestToolChoiceAutoHandling(t *testing.T) {
+	t.Parallel()
+
+	t.Run("AutoToolChoice_OmitsToolChoice", func(t *testing.T) {
+		autoStr := "auto"
+		deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+			Provider: schemas.Bedrock,
+			Model:    "anthropic.claude-3-5-sonnet-v2",
+			Input: []schemas.ChatMessage{
+				{
+					Role: schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: schemas.Ptr("What's the weather?"),
+					},
+				},
+			},
+			Params: &schemas.ChatParameters{
+				Tools: []schemas.ChatTool{
+					{
+						Type: schemas.ChatToolTypeFunction,
+						Function: &schemas.ChatToolFunction{
+							Name:        "get_weather",
+							Description: schemas.Ptr("Get weather"),
+							Parameters: &schemas.ToolFunctionParameters{
+								Type:       "object",
+								Properties: &testProps,
+							},
+						},
+					},
+				},
+				ToolChoice: &schemas.ChatToolChoice{
+					ChatToolChoiceStr: &autoStr,
+				},
+			},
+		}
+
+		ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+		result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.NotNil(t, result.ToolConfig)
+		assert.Nil(t, result.ToolConfig.ToolChoice, "Auto tool choice should be omitted (nil) as it's the default")
+	})
+
+	t.Run("RequiredToolChoice_SetsAny", func(t *testing.T) {
+		requiredStr := "required"
+		deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+			Provider: schemas.Bedrock,
+			Model:    "anthropic.claude-3-5-sonnet-v2",
+			Input: []schemas.ChatMessage{
+				{
+					Role: schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{
+						ContentStr: schemas.Ptr("What's the weather?"),
+					},
+				},
+			},
+			Params: &schemas.ChatParameters{
+				Tools: []schemas.ChatTool{
+					{
+						Type: schemas.ChatToolTypeFunction,
+						Function: &schemas.ChatToolFunction{
+							Name:        "get_weather",
+							Description: schemas.Ptr("Get weather"),
+							Parameters: &schemas.ToolFunctionParameters{
+								Type:       "object",
+								Properties: &testProps,
+							},
+						},
+					},
+				},
+				ToolChoice: &schemas.ChatToolChoice{
+					ChatToolChoiceStr: &requiredStr,
+				},
+			},
+		}
+
+		ctx := schemas.NewDeepIntShieldContext(context.Background(), schemas.NoDeadline)
+		result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.NotNil(t, result.ToolConfig)
+		require.NotNil(t, result.ToolConfig.ToolChoice)
+		assert.NotNil(t, result.ToolConfig.ToolChoice.Any, "Required tool choice should map to Any")
+	})
+}
+
+func TestDocumentFormatResponseMapping(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		bedrockFormat    string
+		expectedMimeType string
+	}{
+		{"PDF", "pdf", "application/pdf"},
+		{"TXT", "txt", "text/plain"},
+		{"Markdown", "md", "text/markdown"},
+		{"HTML", "html", "text/html"},
+		{"CSV", "csv", "text/csv"},
+		{"DOC", "doc", "application/msword"},
+		{"DOCX", "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+		{"XLS", "xls", "application/vnd.ms-excel"},
+		{"XLSX", "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+		{"Unknown", "xyz", "application/pdf"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			docBytes := "SGVsbG8=" // base64 "Hello"
+			response := &bedrock.BedrockConverseResponse{
+				Output: &bedrock.BedrockConverseOutput{
+					Message: &bedrock.BedrockMessage{
+						Role: bedrock.BedrockMessageRoleAssistant,
+						Content: []bedrock.BedrockContentBlock{
+							{
+								Document: &bedrock.BedrockDocumentSource{
+									Format: tt.bedrockFormat,
+									Name:   "testdoc",
+									Source: &bedrock.BedrockDocumentSourceData{
+										Bytes: &docBytes,
+									},
+								},
+							},
+						},
+					},
+				},
+				StopReason: "end_turn",
+				Usage: &bedrock.BedrockTokenUsage{
+					InputTokens:  10,
+					OutputTokens: 5,
+					TotalTokens:  15,
+				},
+			}
+
+			deepintshieldResp, err := response.ToDeepIntShieldChatResponse(context.Background(), "test-model")
+			require.NoError(t, err)
+			require.NotNil(t, deepintshieldResp)
+			require.Len(t, deepintshieldResp.Choices, 1)
+
+			choice := deepintshieldResp.Choices[0]
+			require.NotNil(t, choice.ChatNonStreamResponseChoice)
+			require.NotNil(t, choice.ChatNonStreamResponseChoice.Message)
+			require.NotNil(t, choice.ChatNonStreamResponseChoice.Message.Content)
+
+			blocks := choice.ChatNonStreamResponseChoice.Message.Content.ContentBlocks
+			require.Len(t, blocks, 1)
+			assert.Equal(t, schemas.ChatContentBlockTypeFile, blocks[0].Type)
+			require.NotNil(t, blocks[0].File)
+			require.NotNil(t, blocks[0].File.FileType)
+			assert.Equal(t, tt.expectedMimeType, *blocks[0].File.FileType,
+				"Bedrock format %q should map to MIME type %q", tt.bedrockFormat, tt.expectedMimeType)
+		})
+	}
+}
+
+// TestBedrockToolInputKeyOrderPreservation verifies that multiple parallel tool calls
+// preserve the client's original key ordering after conversion to Bedrock format.
+func TestBedrockToolInputKeyOrderPreservation(t *testing.T) {
+	deepintshieldReq := &schemas.DeepIntShieldChatRequest{
+		Model: "anthropic.claude-3-sonnet",
+		Input: []schemas.ChatMessage{
+			{
+				Role:    schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("test")},
+			},
+			{
+				Role: schemas.ChatMessageRoleAssistant,
+				ChatAssistantMessage: &schemas.ChatAssistantMessage{
+					ToolCalls: []schemas.ChatAssistantMessageToolCall{
+						{
+							Index: 0,
+							Type:  schemas.Ptr("function"),
+							ID:    schemas.Ptr("toolu_001"),
+							Function: schemas.ChatAssistantMessageToolCallFunction{
+								Name:      schemas.Ptr("bash"),
+								Arguments: `{"description":"Find references quickly","timeout":30000,"command":"grep -r auth_injector ."}`,
+							},
+						},
+						{
+							Index: 1,
+							Type:  schemas.Ptr("function"),
+							ID:    schemas.Ptr("toolu_002"),
+							Function: schemas.ChatAssistantMessageToolCallFunction{
+								Name:      schemas.Ptr("bash"),
+								Arguments: `{"command":"git diff main...HEAD --stat","description":"Show diff of commits"}`,
+							},
+						},
+						{
+							Index: 2,
+							Type:  schemas.Ptr("function"),
+							ID:    schemas.Ptr("toolu_003"),
+							Function: schemas.ChatAssistantMessageToolCallFunction{
+								Name:      schemas.Ptr("bash"),
+								Arguments: `{"command":"git log main..HEAD","description":"Show commits in branch"}`,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ctx, cancel := schemas.NewDeepIntShieldContextWithCancel(nil)
+	defer cancel()
+	result, err := bedrock.ToBedrockChatCompletionRequest(ctx, deepintshieldReq)
+	require.NoError(t, err)
+
+	// Collect all tool use content blocks from assistant messages
+	var toolUseInputs []interface{}
+	for _, msg := range result.Messages {
+		for _, block := range msg.Content {
+			if block.ToolUse != nil {
+				toolUseInputs = append(toolUseInputs, block.ToolUse.Input)
+			}
+		}
+	}
+
+	require.Len(t, toolUseInputs, 3, "expected 3 tool use blocks")
+
+	// Block 0: keys should be description, timeout, command (NOT alphabetical)
+	json0, _ := json.Marshal(toolUseInputs[0])
+	s0 := string(json0)
+	descIdx0 := strings.Index(s0, `"description"`)
+	timeIdx0 := strings.Index(s0, `"timeout"`)
+	cmdIdx0 := strings.Index(s0, `"command"`)
+	if descIdx0 < 0 || timeIdx0 < 0 || cmdIdx0 < 0 {
+		t.Fatalf("block 0: missing expected key(s) in: %s", s0)
+	}
+	assert.True(t, descIdx0 < timeIdx0 && timeIdx0 < cmdIdx0,
+		"block 0: key order not preserved, expected description < timeout < command in: %s", s0)
+
+	// Block 1: keys should be command, description (NOT alphabetical)
+	json1, _ := json.Marshal(toolUseInputs[1])
+	s1 := string(json1)
+	cmdIdx1 := strings.Index(s1, `"command"`)
+	descIdx1 := strings.Index(s1, `"description"`)
+	if cmdIdx1 < 0 || descIdx1 < 0 {
+		t.Fatalf("block 1: missing expected key(s) in: %s", s1)
+	}
+	assert.True(t, cmdIdx1 < descIdx1,
+		"block 1: key order not preserved, expected command < description in: %s", s1)
+
+	// Block 2: keys should be command, description
+	json2, _ := json.Marshal(toolUseInputs[2])
+	s2 := string(json2)
+	cmdIdx2 := strings.Index(s2, `"command"`)
+	descIdx2 := strings.Index(s2, `"description"`)
+	if cmdIdx2 < 0 || descIdx2 < 0 {
+		t.Fatalf("block 2: missing expected key(s) in: %s", s2)
+	}
+	assert.True(t, cmdIdx2 < descIdx2,
+		"block 2: key order not preserved, expected command < description in: %s", s2)
+}

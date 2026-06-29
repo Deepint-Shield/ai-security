@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 380" role="img" aria-label="MCP Gateway Architecture">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#94a3b8" />
+    </marker>
+    <style><![CDATA[
+      .box { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.5; }
+      .agent { fill: #fef3c7; stroke: #d97706; stroke-width: 1.5; }
+      .gw { fill: #ede9fe; stroke: #7c3aed; stroke-width: 1.5; }
+      .srv { fill: #dcfce7; stroke: #16a34a; stroke-width: 1.5; }
+      .label { font: 600 15px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+      .sub { font: 500 12px ui-sans-serif, system-ui, sans-serif; fill: #475569; }
+      .item { font: 500 13px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+      .line { stroke: #94a3b8; stroke-width: 1.5; fill: none; }
+      @media (prefers-color-scheme: dark) {
+        .box { fill: #1e293b; stroke: #64748b; }
+        .agent { fill: #78350f; stroke: #fbbf24; }
+        .gw { fill: #3b1f7a; stroke: #a78bfa; }
+        .srv { fill: #14532d; stroke: #4ade80; }
+        .label, .item { fill: #f1f5f9; }
+        .sub { fill: #cbd5e1; }
+        .line { stroke: #64748b; }
+      }
+    ]]></style>
+  </defs>
+
+  <!-- AI Agent -->
+  <rect class="box agent" x="40" y="140" width="160" height="80" rx="10" />
+  <text class="label" x="120" y="175" text-anchor="middle">AI Agent</text>
+  <text class="sub" x="120" y="195" text-anchor="middle">shield.agent</text>
+
+  <line class="line" x1="200" y1="180" x2="370" y2="180" marker-end="url(#arrow)" />
+
+  <!-- Gateway -->
+  <rect class="box gw" x="370" y="40" width="260" height="280" rx="12" />
+  <text class="label" x="500" y="70" text-anchor="middle">DeepIntShield MCP Gateway</text>
+  <line class="line" x1="390" y1="85" x2="610" y2="85" />
+  <text class="item" x="400" y="115">• Tool Guard</text>
+  <text class="item" x="400" y="140">• Human Approval</text>
+  <text class="item" x="400" y="165">• Server Label Policy</text>
+  <text class="item" x="400" y="190">• Audit Log</text>
+  <text class="item" x="400" y="215">• Rate Limit</text>
+  <text class="item" x="400" y="240">• Input / Output Redaction</text>
+  <text class="sub" x="400" y="270">stage: mcp | action</text>
+  <text class="sub" x="400" y="290">decision: allow · redact · block</text>
+
+  <line class="line" x1="630" y1="180" x2="780" y2="180" marker-end="url(#arrow)" />
+
+  <!-- MCP Servers -->
+  <rect class="box srv" x="780" y="40" width="160" height="280" rx="12" />
+  <text class="label" x="860" y="70" text-anchor="middle">MCP Servers</text>
+  <line class="line" x1="800" y1="85" x2="920" y2="85" />
+  <text class="item" x="810" y="115">• postgres-mcp</text>
+  <text class="item" x="810" y="145">• github-mcp</text>
+  <text class="item" x="810" y="175">• slack-mcp</text>
+  <text class="item" x="810" y="205">• jira-mcp</text>
+  <text class="item" x="810" y="235">• filesystem-mcp</text>
+  <text class="item" x="810" y="265">• custom-mcp</text>
+</svg>

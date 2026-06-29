@@ -1,0 +1,132 @@
+// Package huggingface provides a HuggingFace chat provider.
+package huggingface
+
+import (
+	"fmt"
+
+	"github.com/bytedance/sonic"
+
+	schemas "github.com/deepint-shield/ai-security/core/schemas"
+)
+
+// sanitizeMessagesForHuggingFace removes unsupported ChatAssistantMessage fields
+// from chat messages. HuggingFace's OpenAI-compatible API doesn't support fields
+// like reasoning_details, reasoning, annotations, audio, and refusal.
+// Only ToolCalls is preserved from ChatAssistantMessage.
+func sanitizeMessagesForHuggingFace(messages []schemas.ChatMessage) []schemas.ChatMessage {
+	sanitized := make([]schemas.ChatMessage, len(messages))
+	for i, msg := range messages {
+		sanitized[i] = schemas.ChatMessage{
+			Name:            msg.Name,
+			Role:            msg.Role,
+			Content:         msg.Content,
+			ChatToolMessage: msg.ChatToolMessage,
+		}
+		// Only preserve ToolCalls from ChatAssistantMessage
+		if msg.ChatAssistantMessage != nil && len(msg.ChatAssistantMessage.ToolCalls) > 0 {
+			sanitized[i].ChatAssistantMessage = &schemas.ChatAssistantMessage{
+				ToolCalls: msg.ChatAssistantMessage.ToolCalls,
+			}
+		}
+	}
+	return sanitized
+}
+
+func ToHuggingFaceChatCompletionRequest(deepintshieldReq *schemas.DeepIntShieldChatRequest) (*HuggingFaceChatRequest, error) {
+	if deepintshieldReq == nil || deepintshieldReq.Input == nil {
+		return nil, nil
+	}
+
+	// Create the HuggingFace request
+	// Sanitize messages to remove unsupported fields like reasoning_details
+	hfReq := &HuggingFaceChatRequest{
+		Messages: sanitizeMessagesForHuggingFace(deepintshieldReq.Input),
+		Model:    deepintshieldReq.Model,
+	}
+
+	// Map parameters if present
+	if deepintshieldReq.Params != nil {
+		params := deepintshieldReq.Params
+
+		if params.FrequencyPenalty != nil {
+			hfReq.FrequencyPenalty = params.FrequencyPenalty
+		}
+		if params.LogProbs != nil {
+			hfReq.Logprobs = params.LogProbs
+		}
+		if params.MaxCompletionTokens != nil {
+			hfReq.MaxTokens = params.MaxCompletionTokens
+		}
+		if params.PresencePenalty != nil {
+			hfReq.PresencePenalty = params.PresencePenalty
+		}
+		if params.Seed != nil {
+			hfReq.Seed = params.Seed
+		}
+		if len(params.Stop) > 0 {
+			hfReq.Stop = params.Stop
+		}
+		if params.Temperature != nil {
+			hfReq.Temperature = params.Temperature
+		}
+		if params.TopLogProbs != nil {
+			hfReq.TopLogprobs = params.TopLogProbs
+		}
+		if params.TopP != nil {
+			hfReq.TopP = params.TopP
+		}
+
+		// Handle response format
+		if params.ResponseFormat != nil {
+			// Convert the response format to HuggingFace format
+			responseFormatJSON, err := sonic.Marshal(params.ResponseFormat)
+			if err != nil {
+				return nil, fmt.Errorf("failed to convert ResponseFormat (marshal): %w", err)
+			}
+			var hfResponseFormat HuggingFaceResponseFormat
+			if err := sonic.Unmarshal(responseFormatJSON, &hfResponseFormat); err != nil {
+				return nil, fmt.Errorf("failed to convert ResponseFormat (unmarshal): %w", err)
+			}
+			hfReq.ResponseFormat = &hfResponseFormat
+		}
+
+		// Handle stream options
+		if params.StreamOptions != nil {
+			hfReq.StreamOptions = &schemas.ChatStreamOptions{
+				IncludeUsage: params.StreamOptions.IncludeUsage,
+			}
+		}
+
+		hfReq.Tools = params.Tools
+
+		// Handle tool choice
+		if params.ToolChoice != nil {
+			hfToolChoice := &HuggingFaceToolChoice{}
+			if params.ToolChoice.ChatToolChoiceStr != nil {
+				switch *params.ToolChoice.ChatToolChoiceStr {
+				case "auto":
+					auto := EnumStringTypeAuto
+					hfToolChoice.EnumValue = &auto
+				case "none":
+					none := EnumStringTypeNone
+					hfToolChoice.EnumValue = &none
+				case "required":
+					required := EnumStringTypeRequired
+					hfToolChoice.EnumValue = &required
+				}
+			} else if params.ToolChoice.ChatToolChoiceStruct != nil {
+				if params.ToolChoice.ChatToolChoiceStruct.Type == schemas.ChatToolChoiceTypeFunction && params.ToolChoice.ChatToolChoiceStruct.Function != nil {
+					hfToolChoice.Function = &schemas.ChatToolChoiceFunction{
+						Name: params.ToolChoice.ChatToolChoiceStruct.Function.Name,
+					}
+				}
+			}
+			if hfToolChoice.EnumValue != nil || hfToolChoice.Function != nil {
+				hfReq.ToolChoice = hfToolChoice
+			}
+		}
+		hfReq.ExtraParams = deepintshieldReq.Params.ExtraParams
+	}
+
+	return hfReq, nil
+}

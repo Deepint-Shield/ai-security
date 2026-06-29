@@ -1,0 +1,4 @@
+# The OSS examples use ONLY the deepintshield SDK. The [openai] / [anthropic]
+# extras pull the provider client libraries that the SDK's .openai() / .anthropic()
+# helpers wrap - you do not install openai/anthropic yourself.
+deepintshield[openai,anthropic]>=2.4.0

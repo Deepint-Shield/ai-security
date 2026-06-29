@@ -1,0 +1,85 @@
+{
+  "$schema": "https://deepintshield.com/schema",
+  "client": {
+    "enable_logging": true
+  },
+  "providers": {},
+  "config_store": {
+    "enabled": true,
+    "type": "postgres",
+    "config": {
+      "host": "env.DEEPINTSHIELD_PGHOST",
+      "port": "env.DEEPINTSHIELD_PGPORT",
+      "user": "env.DEEPINTSHIELD_PGUSER",
+      "password": "env.DEEPINTSHIELD_PGPASSWORD",
+      "db_name": "env.DEEPINTSHIELD_PGDATABASE",
+      "ssl_mode": "disable",
+      "max_idle_conns": 10,
+      "max_open_conns": 25
+    }
+  },
+  "logs_store": {
+    "enabled": true,
+    "type": "postgres",
+    "config": {
+      "host": "env.DEEPINTSHIELD_PGHOST",
+      "port": "env.DEEPINTSHIELD_PGPORT",
+      "user": "env.DEEPINTSHIELD_PGUSER",
+      "password": "env.DEEPINTSHIELD_PGPASSWORD",
+      "db_name": "env.DEEPINTSHIELD_PGDATABASE",
+      "ssl_mode": "disable",
+      "max_idle_conns": 10,
+      "max_open_conns": 50
+    }
+  },
+  "vector_store": {
+    "enabled": true,
+    "type": "redis",
+    "config": {
+      "addr": "env.DEEPINTSHIELD_REDIS_ADDR",
+      "db": "env.DEEPINTSHIELD_REDIS_DB",
+      "pool_size": 20,
+      "max_active_conns": 50,
+      "min_idle_conns": 5,
+      "max_idle_conns": 10
+    }
+  },
+  "plugins": [
+    {
+      "enabled": true,
+      "name": "guardrails",
+      "config": {
+        "use_embedded_runtime": true,
+        "prefer_grpc": false,
+        "runtime_timeout_ms": 3000,
+        "async_persistence": true,
+        "persistence_workers": 4,
+        "persistence_queue_size": 512,
+        "fail_open": true
+      }
+    },
+    {
+      "enabled": true,
+      "name": "semantic_cache",
+      "config": {
+        "provider": "openai",
+        "keys": [
+          {
+            "name": "Semantic Cache Embedding Key",
+            "value": "local",
+            "weight": 1
+          }
+        ],
+        "network_config": {
+          "base_url": "http://deepintshield-models:8093"
+        },
+        "embedding_model": "BAAI/bge-base-en-v1.5",
+        "dimension": 768,
+        "threshold": 0.75,
+        "ttl": "10m",
+        "cache_by_model": true,
+        "cache_by_provider": true
+      }
+    }
+  ]
+}

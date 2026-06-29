@@ -1,0 +1,15 @@
+.multiselect-control {
+	border-color: color-mix(in srgb, hsl(var(--border)) 82%, transparent);
+	box-shadow: none;
+	background: color-mix(in srgb, hsl(var(--background)) 84%, transparent);
+
+	&:hover {
+		border-color: color-mix(in srgb, hsl(var(--primary)) 42%, hsl(var(--border))) !important;
+	}
+}
+
+.multiselect-option {
+	&:hover {
+		background-color: color-mix(in srgb, hsl(var(--primary)) 16%, hsl(var(--accent))) !important;
+	}
+}

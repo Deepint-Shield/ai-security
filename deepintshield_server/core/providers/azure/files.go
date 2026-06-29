@@ -1,0 +1,124 @@
+package azure
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/deepint-shield/ai-security/core/providers/openai"
+	providerUtils "github.com/deepint-shield/ai-security/core/providers/utils"
+	"github.com/deepint-shield/ai-security/core/schemas"
+	"github.com/valyala/fasthttp"
+)
+
+// setAzureAuth sets the Azure authentication header on the request for OpenAI models.
+// It handles authentication in order of priority:
+// 1. Service Principal (client ID/secret/tenant ID) - uses Bearer token
+// 2. Context token - uses Bearer token
+// 3. API key - uses api-key header
+// 4. DefaultAzureCredential auto-detection (managed identity, workload identity, env vars, CLI)
+func (provider *AzureProvider) setAzureAuth(ctx context.Context, req *fasthttp.Request, key schemas.Key) *schemas.DeepIntShieldError {
+	// Service Principal authentication
+	if key.AzureKeyConfig != nil && key.AzureKeyConfig.ClientID != nil &&
+		key.AzureKeyConfig.ClientSecret != nil && key.AzureKeyConfig.TenantID != nil && key.AzureKeyConfig.ClientID.GetValue() != "" && key.AzureKeyConfig.ClientSecret.GetValue() != "" && key.AzureKeyConfig.TenantID.GetValue() != "" {
+		cred, err := provider.getOrCreateAuth(key.AzureKeyConfig.TenantID.GetValue(), key.AzureKeyConfig.ClientID.GetValue(), key.AzureKeyConfig.ClientSecret.GetValue())
+		if err != nil {
+			return providerUtils.NewDeepIntShieldOperationError("failed to get or create Azure authentication", err, schemas.Azure)
+		}
+
+		scopes := getAzureScopes(key.AzureKeyConfig.Scopes)
+
+		token, err := cred.GetToken(ctx, policy.TokenRequestOptions{
+			Scopes: scopes,
+		})
+		if err != nil {
+			return providerUtils.NewDeepIntShieldOperationError("failed to get Azure access token", err, schemas.Azure)
+		}
+
+		if token.Token == "" {
+			return providerUtils.NewDeepIntShieldOperationError("Azure access token is empty", fmt.Errorf("token is empty"), schemas.Azure)
+		}
+
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token.Token))
+		req.Header.Del("api-key")
+		return nil
+	}
+
+	// Context token authentication
+	if authToken, ok := ctx.Value(AzureAuthorizationTokenKey).(string); ok && authToken != "" {
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
+		req.Header.Del("api-key")
+		return nil
+	}
+
+	// API key authentication
+	value := key.Value.GetValue()
+	if value != "" {
+		req.Header.Del("Authorization")
+		req.Header.Set("api-key", value)
+		return nil
+	}
+
+	// No explicit credentials - attempt DefaultAzureCredential auto-detection.
+	scopes := getAzureScopes(nil)
+	if key.AzureKeyConfig != nil {
+		scopes = getAzureScopes(key.AzureKeyConfig.Scopes)
+	}
+
+	cred, err := provider.getOrCreateDefaultAzureCredential()
+	if err != nil {
+		return providerUtils.NewDeepIntShieldOperationError("no credentials provided and DefaultAzureCredential unavailable", err, schemas.Azure)
+	}
+
+	token, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: scopes})
+	if err != nil {
+		return providerUtils.NewDeepIntShieldOperationError("no credentials provided and DefaultAzureCredential failed to get token", err, schemas.Azure)
+	}
+
+	if token.Token == "" {
+		return providerUtils.NewDeepIntShieldOperationError("no credentials provided and DefaultAzureCredential returned empty token", fmt.Errorf("token is empty"), schemas.Azure)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token.Token))
+	req.Header.Del("api-key")
+	return nil
+}
+
+// AzureFileResponse represents an Azure file response (same as OpenAI).
+type AzureFileResponse struct {
+	ID            string              `json:"id"`
+	Object        string              `json:"object"`
+	Bytes         int64               `json:"bytes"`
+	CreatedAt     int64               `json:"created_at"`
+	Filename      string              `json:"filename"`
+	Purpose       schemas.FilePurpose `json:"purpose"`
+	Status        string              `json:"status,omitempty"`
+	StatusDetails *string             `json:"status_details,omitempty"`
+}
+
+// ToDeepIntShieldFileUploadResponse converts Azure file response to DeepIntShield response.
+func (r *AzureFileResponse) ToDeepIntShieldFileUploadResponse(providerName schemas.ModelProvider, latency time.Duration, sendBackRawResponse bool, rawResponse interface{}) *schemas.DeepIntShieldFileUploadResponse {
+	resp := &schemas.DeepIntShieldFileUploadResponse{
+		ID:             r.ID,
+		Object:         r.Object,
+		Bytes:          r.Bytes,
+		CreatedAt:      r.CreatedAt,
+		Filename:       r.Filename,
+		Purpose:        r.Purpose,
+		Status:         openai.ToDeepIntShieldFileStatus(r.Status),
+		StatusDetails:  r.StatusDetails,
+		StorageBackend: schemas.FileStorageAPI,
+		ExtraFields: schemas.DeepIntShieldResponseExtraFields{
+			RequestType: schemas.FileUploadRequest,
+			Provider:    providerName,
+			Latency:     latency.Milliseconds(),
+		},
+	}
+
+	if sendBackRawResponse {
+		resp.ExtraFields.RawResponse = rawResponse
+	}
+
+	return resp
+}

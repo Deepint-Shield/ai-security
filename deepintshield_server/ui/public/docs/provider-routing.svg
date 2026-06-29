@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 400" role="img" aria-label="Provider Routing">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#94a3b8" />
+    </marker>
+    <style><![CDATA[
+      .box { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.5; }
+      .app { fill: #fef3c7; stroke: #d97706; stroke-width: 1.5; }
+      .gw { fill: #ede9fe; stroke: #7c3aed; stroke-width: 1.5; }
+      .prov { fill: #dbeafe; stroke: #2563eb; stroke-width: 1.5; }
+      .label { font: 600 15px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+      .sub { font: 500 12px ui-sans-serif, system-ui, sans-serif; fill: #475569; }
+      .item { font: 500 13px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+      .line { stroke: #94a3b8; stroke-width: 1.5; fill: none; }
+      @media (prefers-color-scheme: dark) {
+        .box { fill: #1e293b; stroke: #64748b; }
+        .app { fill: #78350f; stroke: #fbbf24; }
+        .gw { fill: #3b1f7a; stroke: #a78bfa; }
+        .prov { fill: #1e3a8a; stroke: #60a5fa; }
+        .label, .item { fill: #f1f5f9; }
+        .sub { fill: #cbd5e1; }
+        .line { stroke: #64748b; }
+      }
+    ]]></style>
+  </defs>
+
+  <!-- Your App -->
+  <rect class="box app" x="40" y="150" width="160" height="80" rx="10" />
+  <text class="label" x="120" y="185" text-anchor="middle">Your App</text>
+  <text class="sub" x="120" y="205" text-anchor="middle">OpenAI / Anthropic</text>
+  <text class="sub" x="120" y="220" text-anchor="middle">native SDK</text>
+
+  <line class="line" x1="200" y1="190" x2="370" y2="190" marker-end="url(#arrow)" />
+
+  <!-- Gateway -->
+  <rect class="box gw" x="370" y="60" width="240" height="260" rx="12" />
+  <text class="label" x="490" y="90" text-anchor="middle">DeepIntShield Gateway</text>
+  <text class="sub" x="490" y="108" text-anchor="middle">app.deepintshield.com</text>
+  <line class="line" x1="390" y1="122" x2="590" y2="122" />
+
+  <text class="item" x="400" y="150">• Guardrails</text>
+  <text class="item" x="400" y="175">• Policies</text>
+  <text class="item" x="400" y="200">• Routing &amp; Fallback</text>
+  <text class="item" x="400" y="225">• Audit Log</text>
+  <text class="item" x="400" y="250">• Rate Limit &amp; Budgets</text>
+  <text class="item" x="400" y="275">• Virtual Key Auth</text>
+  <text class="sub" x="400" y="300">x-bf-vk header</text>
+
+  <line class="line" x1="610" y1="190" x2="760" y2="190" marker-end="url(#arrow)" />
+
+  <!-- Providers -->
+  <rect class="box prov" x="760" y="60" width="180" height="260" rx="12" />
+  <text class="label" x="850" y="90" text-anchor="middle">LLM Providers</text>
+  <line class="line" x1="780" y1="102" x2="920" y2="102" />
+  <text class="item" x="790" y="130">• OpenAI</text>
+  <text class="item" x="790" y="155">• Anthropic</text>
+  <text class="item" x="790" y="180">• AWS Bedrock</text>
+  <text class="item" x="790" y="205">• Google GenAI</text>
+  <text class="item" x="790" y="230">• LiteLLM</text>
+  <text class="item" x="790" y="255">• LangChain</text>
+  <text class="item" x="790" y="280">• PydanticAI</text>
+  <text class="item" x="790" y="305">• Passthrough</text>
+</svg>

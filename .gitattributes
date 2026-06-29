@@ -1,0 +1,5 @@
+# PGO profiles are binary stack samples. Mark them so git treats them as
+# binary (no diff, no merge) and consider Git LFS if they grow beyond a
+# few MB.
+*.pgo binary
+default.pgo binary

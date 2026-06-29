@@ -1,0 +1,13 @@
+DeepintShield
+Copyright 2026 DeepintShield
+
+This product includes software derived from Bifrost, an open-source AI gateway
+originally developed by Maxim HQ (https://github.com/maximhq/bifrost), licensed
+under the Apache License, Version 2.0.
+
+Portions of the gateway core, provider adapters, and HTTP transport are based on
+that original work. In accordance with Section 4 of the Apache License, this
+notice retains attribution to the original copyright holder.
+
+The DeepintShield name, branding, and the additional security, governance, and
+agentic features are the property of DeepintShield.

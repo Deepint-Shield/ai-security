@@ -1,0 +1,374 @@
+name: Release
+
+# Builds the embedded Next.js dashboard, cross-compiles the deepintshield-http
+# gateway for every supported platform, attaches the binaries (+ SHA-256
+# sidecars) to the GitHub Release for the pushed tag, publishes the
+# @deepintshield/ai-security npx wrapper to npm, and pushes the
+# deepintshield/ai-security multi-arch Docker image - all from the one tag, at
+# the same version, in lock-step.
+#
+# Trigger by pushing a semver tag:  git tag v0.1.0 && git push origin v0.1.0
+# or run manually via the Actions tab (workflow_dispatch) with a tag input.
+
+on:
+  push:
+    tags:
+      # Plausible semver tags (e.g. v0.1.0, v1.2.3, v1.2.3-rc.1). The build and
+      # npm jobs strictly re-validate the format before doing any real work.
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing semver tag to build and release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write # create the release and upload assets
+
+env:
+  GO_VERSION: "1.26.1"
+  NODE_VERSION: "20"
+
+jobs:
+  # 1. Build the static dashboard once; every binary embeds the same output.
+  ui:
+    name: Build embedded UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: deepintshield_server/ui/package.json
+      - name: Build static UI
+        working-directory: deepintshield_server/ui
+        # `npm run build` runs `next build && fix-paths && copy-build`, which
+        # writes the static export to transports/deepintshield-http/ui.
+        # `npm install` (not `npm ci`) because package-lock.json is untracked.
+        run: |
+          npm install
+          npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: embedded-ui
+          path: deepintshield_server/transports/deepintshield-http/ui
+          if-no-files-found: error
+          retention-days: 1
+
+  # 2. Cross-compile the gateway. CGO is mandatory (mattn/go-sqlite3), so each
+  #    target uses a native or properly-configured C toolchain - never a bare
+  #    GOARCH override against a mismatched compiler.
+  build:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: ui
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin, goarch: arm64, runner: macos-14 }
+          - { goos: darwin, goarch: amd64, runner: macos-14, cc: "clang -arch x86_64" }
+          - { goos: linux, goarch: amd64, runner: ubuntu-22.04 }
+          - { goos: linux, goarch: arm64, runner: ubuntu-22.04, cross: aarch64 }
+          - { goos: windows, goarch: amd64, runner: windows-2022, ext: ".exe" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Build the tagged commit, including on workflow_dispatch (where the
+          # default checkout would otherwise build the branch HEAD).
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # The build runs in the transports module; point the cache there so
+          # the module cache actually keys on the right go.sum (the repo has no
+          # root go.mod, so the default lookup would miss and warn).
+          cache-dependency-path: deepintshield_server/transports/go.sum
+      - name: Download embedded UI
+        uses: actions/download-artifact@v4
+        with:
+          name: embedded-ui
+          path: deepintshield_server/transports/deepintshield-http/ui
+      - name: Install aarch64 cross toolchain
+        if: matrix.cross == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Set up MinGW C toolchain (windows)
+        # CGO is mandatory; the windows-2022 image ships a mingw gcc but not on
+        # the default PATH, so install/expose it explicitly. NOTE: this is the
+        # one target not yet validated locally - check the first run's log.
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install mingw -y --no-progress
+          # 3010 = "reboot required", a non-fatal choco success code.
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+            throw "choco install mingw failed with exit code $LASTEXITCODE"
+          }
+          $candidates = @(
+            "C:\ProgramData\mingw64\mingw64\bin",
+            "C:\ProgramData\mingw64\bin",
+            "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin"
+          )
+          $gccDir = $candidates | Where-Object { Test-Path (Join-Path $_ "gcc.exe") } | Select-Object -First 1
+          if (-not $gccDir) {
+            $found = Get-ChildItem -Path "C:\ProgramData" -Recurse -Filter gcc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $gccDir = Split-Path $found.FullName }
+          }
+          if (-not $gccDir) { throw "mingw gcc not found after install" }
+          Add-Content -Path $env:GITHUB_PATH -Value $gccDir
+          Write-Host "Using gcc from $gccDir"
+          # Success is decided by the gcc probe above, not choco's residual code.
+          exit 0
+      - name: Build binary
+        shell: bash
+        working-directory: deepintshield_server/transports/deepintshield-http
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          # Pass tag/matrix values via env (never interpolated into the script)
+          # so an operator-supplied workflow_dispatch tag cannot inject shell.
+          RELEASE_REF: ${{ github.event.inputs.tag || github.ref_name }}
+          MATRIX_CC: ${{ matrix.cc }}
+          MATRIX_CROSS: ${{ matrix.cross }}
+          MATRIX_EXT: ${{ matrix.ext }}
+        run: |
+          set -euo pipefail
+          TAG="$RELEASE_REF"
+          # [[ =~ ]] matches the whole string (unlike grep's per-line match).
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Refusing to build: tag '$TAG' is not a semver tag (e.g. v1.2.3 or v1.2.3-rc.1)" >&2
+            exit 1
+          fi
+          if [ "$MATRIX_CROSS" = "aarch64" ]; then export CC=aarch64-linux-gnu-gcc; fi
+          if [ -n "$MATRIX_CC" ]; then export CC="$MATRIX_CC"; fi
+          if command -v gcc >/dev/null 2>&1; then gcc --version | head -1; fi
+          OUT="deepintshield-http-${GOOS}-${GOARCH}${MATRIX_EXT}"
+          echo "Building $OUT (CC=${CC:-default}) for $TAG"
+          go build -trimpath -ldflags "-s -w -X main.Version=${TAG}" -o "$OUT" .
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$OUT" | awk '{print $1}' > "$OUT.sha256"
+          else
+            shasum -a 256 "$OUT" | awk '{print $1}' > "$OUT.sha256"
+          fi
+          ls -lh "$OUT" "$OUT.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            deepintshield_server/transports/deepintshield-http/deepintshield-http-${{ matrix.goos }}-${{ matrix.goarch }}*
+          if-no-files-found: error
+          retention-days: 1
+
+  # 3. Attach every binary + checksum to the GitHub Release for this tag.
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - run: ls -lhR dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          # A hyphen in the tag marks a prerelease (e.g. v1.2.3-rc.1); GitHub
+          # then never moves the "latest" pointer to it, protecting users who
+          # run DEEPINTSHIELD_VERSION=latest.
+          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  # 4. Stamp the wrapper version from the tag and publish to npm.
+  #    Requires repository secret NPM_TOKEN (an npm automation/publish token
+  #    for the @deepintshield scope). If the secret is absent the step is a
+  #    no-op, so the binary release still succeeds.
+  npm:
+    name: Publish npm package
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
+      - name: Stamp version and publish
+        working-directory: npx/ai-security
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Via env (not interpolated into the script) to prevent shell injection.
+          RELEASE_REF: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN secret not set - skipping npm publish. Binaries were still released."
+            exit 0
+          fi
+          VERSION="${RELEASE_REF#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Refusing to publish: '$VERSION' is not a valid semver version" >&2
+            exit 1
+          fi
+          # Idempotent: a re-run for an already-published version is a no-op
+          # (npm would otherwise hard-fail on republish).
+          if npm view "@deepintshield/ai-security@${VERSION}" version >/dev/null 2>&1; then
+            echo "@deepintshield/ai-security@${VERSION} already published - skipping."
+            exit 0
+          fi
+          # Prereleases publish to the 'next' dist-tag so a plain
+          # `npx @deepintshield/ai-security` never resolves an RC.
+          case "$VERSION" in
+            *-*) DIST_TAG=next ;;
+            *) DIST_TAG=latest ;;
+          esac
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm publish --access public --tag "$DIST_TAG"
+
+  # 5. Build the container image for EACH architecture on its OWN native runner
+  #    (no QEMU emulation - free arm64 runners are available on public repos),
+  #    pushing each by digest. Job 6 stitches them into one multi-arch tag.
+  #    Requires repository secrets DOCKERHUB_USERNAME + DOCKERHUB_TOKEN; if the
+  #    token is absent both jobs no-op so the binary + npm release still succeed.
+  docker:
+    name: Build image (${{ matrix.platform }})
+    needs: release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    outputs:
+      enabled: ${{ steps.creds.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: Check Docker Hub credentials
+        id: creds
+        shell: bash
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "DOCKERHUB_TOKEN secret not set - skipping docker build/push. The GitHub Release + npm package still shipped."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Resolve version
+        id: ver
+        if: steps.creds.outputs.enabled == 'true'
+        shell: bash
+        env:
+          RELEASE_REF: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_REF#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Refusing to build image: '$VERSION' is not a valid semver version" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        if: steps.creds.outputs.enabled == 'true'
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to Docker Hub
+        if: steps.creds.outputs.enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        if: steps.creds.outputs.enabled == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deepintshield_server/transports/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+          outputs: type=image,name=deepintshield/ai-security,push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+      - name: Export digest
+        if: steps.creds.outputs.enabled == 'true'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - name: Upload digest
+        if: steps.creds.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # 6. Merge the per-arch digests into a single multi-arch tag (version + latest)
+  #    and push the manifest list to Docker Hub.
+  docker-merge:
+    name: Publish Docker image
+    needs: docker
+    if: needs.docker.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve image tags
+        id: tags
+        shell: bash
+        env:
+          RELEASE_REF: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_REF#v}"
+          IMAGE=deepintshield/ai-security
+          TAGS="-t ${IMAGE}:${VERSION}"
+          # Only a final release (no hyphen/prerelease) moves the :latest tag.
+          case "$VERSION" in
+            *-*) : ;;
+            *) TAGS="${TAGS} -t ${IMAGE}:latest" ;;
+          esac
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create ${{ steps.tags.outputs.tags }} \
+            $(printf '${{ steps.tags.outputs.image }}@sha256:%s ' *)
+      - name: Inspect
+        run: |
+          docker buildx imagetools inspect ${{ steps.tags.outputs.image }}:${{ steps.tags.outputs.version }}

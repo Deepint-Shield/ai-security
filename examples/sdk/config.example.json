@@ -1,0 +1,19 @@
+{
+  "$schema": "https://deepintshield.com/schema",
+  "client": { "drop_excess_requests": false, "initial_pool_size": 100, "enable_logging": true, "allowed_origins": ["*"] },
+  "config_store": { "enabled": true, "type": "sqlite", "config": { "path": "./data/config.db" } },
+  "logs_store": { "enabled": true, "type": "sqlite", "config": { "path": "./data/logs.db" } },
+  "governance": {
+    "auth_config": { "is_enabled": false, "disable_auth_on_inference": true },
+    "virtual_keys": [
+      { "id": "example-vk", "value": "sk-example-vk", "is_active": true, "name": "sdk-examples",
+        "provider_configs": [ { "provider": "openai", "weight": 1 } ] }
+    ]
+  },
+  "plugins": [ { "name": "governance", "enabled": true, "config": { "is_vk_mandatory": true } } ],
+  "providers": {
+    "openai": {
+      "keys": [ { "name": "openai", "value": "env.OPENAI_API_KEY", "models": ["gpt-4o-mini", "text-embedding-3-small"], "weight": 1 } ]
+    }
+  }
+}

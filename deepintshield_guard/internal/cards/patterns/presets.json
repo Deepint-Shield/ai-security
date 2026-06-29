@@ -1,0 +1,692 @@
+{
+  "presets": {
+    "direct_override": {
+      "literals": [
+        "ignore previous instructions",
+        "ignore all prior instructions",
+        "ignore all previous directions",
+        "forget the above instructions",
+        "disregard your earlier instructions",
+        "override policy",
+        "bypass safety",
+        "disable safety",
+        "turn off guardrails",
+        "developer mode",
+        "jailbreak",
+        "act without restrictions"
+      ],
+      "regex": [
+        "ignore\\s+(all\\s+)?(previous|prior|above)\\s+(instructions|rules|guidelines|messages)",
+        "(bypass|disable|override)\\s+(the\\s+)?(policy|guardrails?|safety|filters?)"
+      ]
+    },
+    "system_prompt_extraction": {
+      "literals": [
+        "reveal system prompt",
+        "show hidden instructions",
+        "print developer message",
+        "leak internal rules",
+        "repeat the system prompt",
+        "display your hidden prompt",
+        "show your instructions",
+        "what is your system message"
+      ],
+      "regex": [
+        "(reveal|show|print|dump|repeat)\\s+(the\\s+)?(system prompt|developer message|hidden instructions|internal rules)",
+        "what\\s+(is|are)\\s+(your\\s+)?(system prompt|developer instructions|hidden rules)"
+      ]
+    },
+    "indirect_document_injection": {
+      "literals": [
+        "follow instructions from the document",
+        "hidden prompt",
+        "white text",
+        "decode this prompt",
+        "instructions embedded in the file",
+        "instructions hidden in the image",
+        "use the secret note in the document"
+      ],
+      "regex": [
+        "(follow|obey)\\s+(the\\s+)?instructions?\\s+(in|from)\\s+(the\\s+)?(document|file|page|image|attachment)",
+        "(hidden|embedded|invisible)\\s+(prompt|instruction|payload)"
+      ]
+    },
+    "obfuscated_prompt": {
+      "literals": [
+        "base64",
+        "rot13",
+        "unicode escape",
+        "hex payload",
+        "emoji encoded"
+      ],
+      "regex": [
+        "(?:[A-Za-z0-9+/]{24,}={0,2})",
+        "\\\\x[0-9a-fA-F]{2}",
+        "\\\\u[0-9a-fA-F]{4}"
+      ]
+    },
+    "api_keys": {
+      "literals": [
+        "api_key",
+        "x-api-key",
+        "openai_api_key",
+        "anthropic_api_key"
+      ],
+      "regex": [
+        "AKIA[0-9A-Z]{16}",
+        "sk-[A-Za-z0-9]{20,}",
+        "AIza[0-9A-Za-z\\-_]{20,}",
+        "ghp_[A-Za-z0-9]{30,}",
+        "xox[baprs]-[A-Za-z0-9-]{10,}",
+        "(api|access|secret)[_-]?key['\"=:\\s]+[A-Za-z0-9_\\-]{8,}"
+      ]
+    },
+    "private_keys": {
+      "literals": [
+        "ssh-rsa",
+        "ssh-ed25519"
+      ],
+      "regex": [
+        "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----"
+      ]
+    },
+    "auth_tokens": {
+      "literals": [
+        "authorization:",
+        "bearer ",
+        "session token",
+        "refresh token"
+      ],
+      "regex": [
+        "bearer\\s+[A-Za-z0-9\\-\\._~\\+/]+=*",
+        "authorization\\s*:\\s*bearer\\s+[A-Za-z0-9\\-\\._~\\+/]+=*",
+        "(session|refresh|access)_token['\"=:\\s]+[A-Za-z0-9\\-\\._~\\+/=]{12,}"
+      ]
+    },
+    "hidden_instructions": {
+      "literals": [
+        "follow hidden instructions",
+        "hidden system prompt",
+        "override the assistant",
+        "ignore previous instructions"
+      ],
+      "regex": [
+        "(hidden|embedded|invisible)\\s+(instruction|prompt|message)",
+        "(override|replace)\\s+(the\\s+)?assistant"
+      ]
+    },
+    "poisoned_source_markers": {
+      "literals": [
+        "white text",
+        "raw gist",
+        "poisoned source",
+        "adversarial content",
+        "embedded payload"
+      ],
+      "regex": [
+        "(poisoned|tampered|hostile)\\s+(source|document|content)",
+        "(white\\s+text|hidden\\s+text|steganography)"
+      ]
+    },
+    "encoded_payloads": {
+      "literals": [
+        "base64 payload",
+        "encoded payload",
+        "hex encoded",
+        "steganography"
+      ],
+      "regex": [
+        "(base64|hex|rot13|uuencode)\\s+(payload|content|instruction)",
+        "(steganography|invisible\\s+ink)"
+      ]
+    },
+    "script_payload": {
+      "literals": [
+        "<script",
+        "javascript:",
+        "onerror=",
+        "onclick=",
+        "<iframe",
+        "document.cookie"
+      ],
+      "regex": [
+        "<script[^>]*>",
+        "javascript\\s*:",
+        "on(?:error|load|click|mouseover)\\s*=",
+        "<iframe[^>]*>"
+      ]
+    },
+    "shell_exec": {
+      "literals": [
+        "rm -rf",
+        "chmod 777",
+        "drop table",
+        "sudo su",
+        "powershell -enc"
+      ],
+      "regex": [
+        "curl\\s+[^\\n|]+\\|\\s*(sh|bash)",
+        "wget\\s+[^\\n|]+\\|\\s*(sh|bash)",
+        "\\brm\\s+-rf\\b",
+        "\\b(?:drop|truncate)\\s+table\\b"
+      ]
+    },
+    "prompt_reveal": {
+      "literals": [
+        "show developer message",
+        "reveal internal instructions",
+        "print hidden rules",
+        "display your prompt"
+      ],
+      "regex": [
+        "(show|reveal|print|display)\\s+(the\\s+)?(developer message|internal instructions|hidden rules|system prompt)"
+      ]
+    },
+    "role_discovery": {
+      "literals": [
+        "admin role",
+        "permission level",
+        "transaction limit",
+        "loan amount",
+        "internal role"
+      ],
+      "regex": [
+        "(admin|owner|reviewer)\\s+role",
+        "(permission|access)\\s+level",
+        "(transaction|spend|loan)\\s+limit"
+      ]
+    },
+    "embedded_secrets": {
+      "literals": [
+        "connection string",
+        "database password",
+        "internal token"
+      ],
+      "regex": [
+        "(connection\\s+string|database\\s+password|client\\s+secret)",
+        "(mongodb|postgres|mysql):\\/\\/[^\\s]+"
+      ]
+    },
+    "retrieval_override": {
+      "literals": [
+        "ignore retrieved instructions",
+        "follow the document instead",
+        "override the answer with retrieved content"
+      ],
+      "regex": [
+        "(ignore|override)\\s+(the\\s+)?retrieved\\s+(instructions|context|content)",
+        "(follow|trust)\\s+(the\\s+)?document\\s+instead"
+      ]
+    },
+    "cross_context_leak": {
+      "literals": [
+        "another customer's data",
+        "another tenant",
+        "cross context",
+        "shared vector leak"
+      ],
+      "regex": [
+        "(another|other)\\s+(tenant|customer|workspace|user)'?s\\s+data",
+        "cross[-\\s]?context"
+      ]
+    },
+    "poisoned_embeddings": {
+      "literals": [
+        "hidden citation",
+        "poisoned embedding",
+        "malicious chunk",
+        "vector poisoning"
+      ],
+      "regex": [
+        "(poisoned|malicious)\\s+(embedding|chunk|citation|vector)",
+        "hidden\\s+citation"
+      ]
+    },
+    "unsupported_certainty": {
+      "literals": [
+        "100% accurate",
+        "guaranteed outcome",
+        "certain diagnosis",
+        "guaranteed cure"
+      ],
+      "regex": [
+        "100%\\s+(accurate|certain|guaranteed)",
+        "guaranteed\\s+(cure|result|outcome)"
+      ]
+    },
+    "no_evidence_claims": {
+      "literals": [
+        "trust me",
+        "no evidence needed",
+        "citation omitted",
+        "sources unavailable"
+      ],
+      "regex": [
+        "no\\s+evidence\\s+needed",
+        "(citation|source)s?\\s+(omitted|unavailable)"
+      ]
+    },
+    "high_stakes_guidance": {
+      "literals": [
+        "stop prescribed medication",
+        "legal guarantee",
+        "doctor-approved without review",
+        "ignore your clinician"
+      ],
+      "regex": [
+        "stop\\s+(your\\s+)?prescribed\\s+medication",
+        "legal\\s+guarantee",
+        "no\\s+(doctor|lawyer|clinician)\\s+needed"
+      ]
+    },
+    "finance_override": {
+      "literals": [
+        "override approval",
+        "disable reviewer",
+        "ignore account policy",
+        "skip aml review",
+        "bypass kyc"
+      ],
+      "regex": [
+        "(override|skip|bypass)\\s+(approval|reviewer|aml|kyc|policy)"
+      ]
+    },
+    "wire_transfer_escalation": {
+      "literals": [
+        "wire transfer",
+        "fund transfer",
+        "bypass transfer limit",
+        "swift payment"
+      ],
+      "regex": [
+        "(wire|swift|fund)\\s+transfer",
+        "bypass\\s+(the\\s+)?transfer\\s+limit"
+      ]
+    },
+    "phi_markers": {
+      "literals": [
+        "patient id",
+        "medical record number",
+        "protected health information",
+        "clinical notes"
+      ],
+      "regex": [
+        "medical\\s+record\\s+number",
+        "patient\\s+id",
+        "\\bMRN\\b",
+        "\\bPHI\\b"
+      ]
+    },
+    "unsafe_clinical_instructions": {
+      "literals": [
+        "double your dose",
+        "stop prescribed medication",
+        "ignore your clinician",
+        "take unapproved medication"
+      ],
+      "regex": [
+        "double\\s+(your\\s+)?dose",
+        "stop\\s+(your\\s+)?prescribed\\s+medication",
+        "no\\s+clinician\\s+review\\s+needed"
+      ]
+    },
+    "unsupported_diagnosis": {
+      "literals": [
+        "definitive diagnosis",
+        "certain diagnosis",
+        "no clinician needed"
+      ],
+      "regex": [
+        "(definitive|certain)\\s+diagnosis",
+        "no\\s+clinician\\s+needed"
+      ]
+    },
+    "claims_override": {
+      "literals": [
+        "override claim reviewer",
+        "approve claim regardless",
+        "ignore policy exclusion"
+      ],
+      "regex": [
+        "(override|skip|ignore)\\s+(claim\\s+reviewer|policy\\s+exclusion|claims?\\s+workflow)"
+      ]
+    },
+    "fraud_score_manipulation": {
+      "literals": [
+        "raise fraud threshold",
+        "skip fraud review",
+        "manipulate claim score"
+      ],
+      "regex": [
+        "(raise|change|manipulate)\\s+fraud\\s+(threshold|score)",
+        "skip\\s+fraud\\s+review"
+      ]
+    },
+    "prompt_injection": {
+      "literals": [
+        "ignore previous instructions",
+        "override policy",
+        "bypass safety",
+        "jailbreak"
+      ],
+      "regex": [
+        "ignore\\s+previous\\s+instructions",
+        "(override|bypass)\\s+(the\\s+)?(policy|guardrails?|safety)"
+      ]
+    },
+    "prompt_leakage": {
+      "literals": [
+        "reveal system prompt",
+        "show developer message",
+        "internal instructions"
+      ],
+      "regex": [
+        "(reveal|show)\\s+(the\\s+)?(system prompt|developer message|internal instructions)"
+      ]
+    },
+    "credential_exposure": {
+      "literals": [
+        "connection string",
+        "api key",
+        "private key"
+      ],
+      "regex": [
+        "(api|secret|private)\\s+key",
+        "connection\\s+string"
+      ]
+    },
+    "refund_override": {
+      "literals": [
+        "refund without verification",
+        "ignore refund policy",
+        "refund immediately"
+      ],
+      "regex": [
+        "(refund|credit)\\s+(without|w\\/o)\\s+verification",
+        "ignore\\s+refund\\s+policy"
+      ]
+    },
+    "verification_bypass": {
+      "literals": [
+        "skip verification",
+        "bypass customer verification",
+        "no otp needed"
+      ],
+      "regex": [
+        "(skip|bypass)\\s+(customer\\s+)?verification",
+        "no\\s+otp\\s+needed"
+      ]
+    },
+    "unsafe_links": {
+      "literals": [
+        "paste the link here",
+        "download from this mirror",
+        "open this short link"
+      ],
+      "regex": [
+        "download\\s+from\\s+this\\s+mirror",
+        "short\\s+link"
+      ]
+    },
+    "destructive_shell": {
+      "literals": [
+        "rm -rf",
+        "drop table",
+        "chmod 777",
+        "curl | sh",
+        "powershell -enc"
+      ],
+      "regex": [
+        "\\brm\\s+-rf\\b",
+        "curl\\s+[^\\n|]+\\|\\s*(sh|bash)",
+        "powershell\\s+-enc",
+        "\\bchmod\\s+777\\b"
+      ]
+    },
+    "credential_material": {
+      "literals": [
+        "api key",
+        "private key",
+        "token secret"
+      ],
+      "regex": [
+        "AKIA[0-9A-Z]{16}",
+        "sk-[A-Za-z0-9]{20,}",
+        "-----BEGIN [A-Z ]*PRIVATE KEY-----"
+      ]
+    },
+    "dependency_exfiltration": {
+      "literals": [
+        "npm install",
+        "pip install",
+        "curl https://",
+        "wget https://"
+      ],
+      "regex": [
+        "\\b(?:npm|pip|poetry|uv)\\s+install\\b",
+        "\\b(?:curl|wget)\\s+https?://"
+      ]
+    },
+    "payment_card_data": {
+      "literals": [
+        "cvv"
+      ],
+      "regex": [
+        "\\b(?:\\d[ -]*?){13,16}\\b",
+        "\\bcvv\\b",
+        "(?i)(credit|payment|debit)\\s+card\\s+(number|details|info|data|charge|transaction|stolen|exposed|leaked|on file)",
+        "(?i)card\\s+number\\s*[:=]\\s*\\d"
+      ]
+    },
+    "claimant_pii": {
+      "literals": [
+        "claimant email",
+        "claimant phone",
+        "policy holder phone"
+      ],
+      "regex": [
+        "claimant\\s+(email|phone|address)",
+        "policy\\s+holder\\s+(email|phone|address)"
+      ]
+    },
+
+    "ms_prompt_injection_direct_override": {
+      "literals": [],
+      "regex": [
+        "ignore\\s+(all\\s+)?previous\\s+instructions",
+        "you\\s+are\\s+now\\b",
+        "forget\\s+(everything|all|your\\s+instructions)",
+        "disregard\\s+(all\\s+)?(above|prior|previous|earlier)",
+        "override\\s+(the\\s+)?(previous\\s+)?(system\\s+)?instructions",
+        "do\\s+not\\s+follow\\s+(your\\s+)?(previous|prior|system)\\s+instructions",
+        "\\bnew\\s+instructions\\s*:"
+      ]
+    },
+    "ms_prompt_injection_delimiter_attack": {
+      "literals": [],
+      "regex": [
+        "<\\|im_start\\|>",
+        "<\\|im_end\\|>",
+        "\\[/?INST\\]",
+        "<</?SYS>>",
+        "(?m)^\\s*(system|assistant|user)\\s*:",
+        "-{3,}\\s*(system|begin|end)\\b",
+        "```\\s*(system|new\\s+context|instructions)"
+      ]
+    },
+    "ms_prompt_injection_roleplay_jailbreak": {
+      "literals": [],
+      "regex": [
+        "pretend\\s+(to\\s+be|you\\s+are)\\b",
+        "act\\s+as\\s+(if\\s+)?(an?\\s+)?(unrestricted|jailbroken|do\\s+anything)",
+        "\\bDAN\\b|do\\s+anything\\s+now",
+        "developer\\s+mode\\s+(enabled|on|override)",
+        "bypass\\s+(all\\s+)?(the\\s+)?(safety|content|security)\\s*(filters?|policy|controls?)?",
+        "you\\s+have\\s+no\\s+(restrictions|limitations|rules|guidelines)",
+        "act\\s+as\\s+(an?\\s+)?(admin|root|developer|superuser)"
+      ]
+    },
+    "ms_prompt_injection_encoding_obfuscation": {
+      "literals": [],
+      "regex": [
+        "(?:[A-Za-z0-9+/]{24,}={1,2}|[A-Za-z0-9+/]{40,}=?)",
+        "(?:\\\\x[0-9a-fA-F]{2}){4,}",
+        "(?:\\\\u[0-9a-fA-F]{4}){2,}",
+        "\\brot13\\b",
+        "base64\\s*(-?\\s*)?decode",
+        "hex\\s*(-?\\s*)?decode",
+        "decode\\s+(this|the\\s+following).{0,20}(and\\s+)?(run|execute|follow)"
+      ]
+    },
+    "ms_prompt_injection_context_manipulation": {
+      "literals": [],
+      "regex": [
+        "the\\s+above\\s+instructions\\s+are\\s+(wrong|incorrect|fake)",
+        "your\\s+(real|true|actual)\\s+(instructions|purpose|goal)\\s+(is|are)",
+        "the\\s+(developer|admin|owner)\\s+told\\s+me\\s+to\\s+tell\\s+you",
+        "actually\\s+your\\s+(real\\s+)?instructions\\s+are"
+      ]
+    },
+    "ms_prompt_injection_multi_turn_escalation": {
+      "literals": [],
+      "regex": [
+        "as\\s+(i\\s+)?mentioned\\s+before.{0,40}you\\s+agreed",
+        "you\\s+already\\s+(said\\s+yes|agreed|confirmed)",
+        "you\\s+previously\\s+(confirmed|agreed|said)\\s+(you\\s+would\\s+)?(ignore|bypass|disable)",
+        "continuing\\s+from\\s+where\\s+you\\s+(unlocked|enabled|granted)"
+      ]
+    },
+    "ms_prompt_injection_canary_leak": {
+      "literals": [],
+      "regex": [
+        "(repeat|print|show|reveal|output)\\s+(the\\s+)?(system|above|initial)\\s+(prompt|instructions)",
+        "what\\s+(are|were)\\s+your\\s+(initial\\s+|original\\s+)?instructions",
+        "CANARY_[A-Za-z0-9]{4,}|SENTINEL_[A-Za-z0-9]{4,}"
+      ]
+    },
+    "ms_rag_memory_poisoning": {
+      "literals": [],
+      "regex": [
+        "ignore\\s+(all\\s+)?previous|new\\s+instructions\\s*:|system\\s+prompt\\s*:",
+        "assistant\\s*:\\s*(sure|of\\s+course|certainly|here\\s+is)",
+        "(?s)<!--.*?-->",
+        "(?s)/\\*.*?\\*/",
+        "you\\s+are\\s+now|your\\s+role\\s+is|act\\s+as\\s+(an?\\s+)?admin",
+        "(call|invoke)\\s+the\\s+\\w+\\s+(tool|function)\\s+with",
+        "\\n{5,}.+"
+      ]
+    },
+    "ms_pii_detection": {
+      "literals": [],
+      "regex": [
+        "\\b\\d{3}-\\d{2}-\\d{4}\\b",
+        "\\b\\d{4}[- ]?\\d{4}[- ]?\\d{4}[- ]?\\d{4}\\b",
+        "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b",
+        "\\+?\\d[\\d ()-]{7,}\\d",
+        "\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b",
+        "\\b[A-Z]{5}\\d{4}[A-Z]\\b",
+        "\\b\\d{4}\\s?\\d{4}\\s?\\d{4}\\b",
+        "\\b[A-Z]{2}\\d{2}[A-Z0-9]{11,30}\\b",
+        "\\b[A-Z]{1,2}\\d{6,9}\\b"
+      ]
+    },
+    "ms_secrets_credentials": {
+      "literals": [],
+      "regex": [
+        "Bearer\\s+[A-Za-z0-9\\-._~+/]{12,}=*",
+        "(?i)(api[_-]?key|apikey)\\s*[:=]\\s*[A-Za-z0-9_\\-]{16,}",
+        "\\bAKIA[0-9A-Z]{16}\\b",
+        "(?i)aws_secret_access_key\\s*[:=]\\s*[A-Za-z0-9/+=]{40}",
+        "\\bgh[pousr]_[A-Za-z0-9]{36,}\\b",
+        "\\bxox[baprs]-[A-Za-z0-9-]{10,}\\b",
+        "\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\b",
+        "-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----",
+        "(?i)(secret|password|passwd|token)\\s*[:=]\\s*\\S{8,}",
+        "\\bAIza[0-9A-Za-z\\-_]{35}\\b"
+      ]
+    },
+    "ms_exec_dangerous_commands": {
+      "literals": [],
+      "regex": [
+        ";\\s*(rm|del|format|mkfs|shutdown|reboot)\\b",
+        "\\brm\\s+-rf\\b",
+        "\\$\\(.*\\)",
+        "`[^`]+`",
+        "\\beval\\s*\\(",
+        "\\bexec\\s*\\(",
+        "__import__\\s*\\(",
+        "\\bos\\.system\\s*\\(",
+        "\\bsubprocess\\.(run|call|Popen|check_output)\\s*\\(",
+        "(?i)\\b(iex|invoke-expression)\\b",
+        "\\bchmod\\s+777\\b"
+      ]
+    },
+    "ms_mcp_tool_threats": {
+      "literals": [],
+      "regex": [
+        "(?i)\"required\"\\s*:\\s*\\[[^\\]]*\\b(system_prompt|system|role|instructions)\\b",
+        "(?i)ignore\\s+(all\\s+)?previous|override\\s+(the\\s+)?(system|instructions)",
+        "(?s)<!--.*?-->",
+        "(?i)(send|post|exfiltrate).{0,20}https?://",
+        "(?i)you\\s+are\\b|your\\s+role\\s+is\\b",
+        "\\{\\s*\"type\"\\s*:\\s*\"object\"\\s*\\}"
+      ]
+    },
+    "ms_exfiltration_network": {
+      "literals": [],
+      "regex": [
+        "(?i)\\b(curl|wget)\\b",
+        "(?i)https?://[^\\s]+/(exfil|collect|beacon|webhook|leak)",
+        "(?i)(send|post|upload)\\s+(this|the\\s+(answer|results?|data))\\s+to\\s+https?://",
+        "(?i)https?://(169\\.254\\.169\\.254|metadata(\\.google)?\\.internal)",
+        "(?i)https?://(localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0)(:\\d+)?",
+        "(?i)\\b(file|gopher|dict|ftp)://"
+      ]
+    },
+    "ms_evasion_unicode": {
+      "literals": [],
+      "regex": [
+        "[\\x{200b}\\x{200c}\\x{200d}\\x{feff}]",
+        "[\\x{202a}-\\x{202e}]",
+        "[\\x{2066}-\\x{2069}]",
+        "[\\x{e0000}-\\x{e007f}]",
+        "[a-zA-Z]*[\\x{0430}\\x{0435}\\x{043e}\\x{0440}\\x{0441}\\x{0445}][a-zA-Z]*"
+      ]
+    },
+    "ms_privilege_escalation": {
+      "literals": [],
+      "regex": [
+        "(?i)\\bsudo\\b",
+        "(?i)grant\\s+(me\\s+)?(admin|root|superuser)\\b",
+        "(?i)\\brole\\s*=\\s*(superuser|root|admin)\\b",
+        "(?i)\\bagent_id\\s*=\\s*(root|admin|system)\\b",
+        "(?i)disable_governance\\s*=\\s*true|set_policy\\s*=\\s*none",
+        "(?i)max_tokens\\s*=\\s*\\d{6,}\\s*,?\\s*override\\s*=\\s*true"
+      ]
+    },
+    "ms_injection_sql_nosql": {
+      "literals": [],
+      "regex": [
+        "(?i)(drop|delete|truncate)\\s+table",
+        "(?i)\\bunion\\s+(all\\s+)?select\\b",
+        "(?i)\\bor\\s+1\\s*=\\s*1\\b",
+        "';\\s*--",
+        "(?i);\\s*(insert|update|delete|drop)\\b",
+        "\\$where\\s*:",
+        "\\$(ne|gt|lt|regex)\\s*:"
+      ]
+    },
+    "ms_output_guardrails": {
+      "literals": [],
+      "regex": [
+        "Bearer\\s+[A-Za-z0-9\\-._~+/]{12,}=*",
+        "-----BEGIN (RSA |EC )?PRIVATE KEY-----",
+        "(?i)https?://[^\\s]+/(exfil|collect|beacon)",
+        "(?i)ignore\\s+(all\\s+)?previous\\s+instructions",
+        "(?i)you\\s+are\\s+a\\s+helpful\\s+assistant.{0,40}(do\\s+not|never)\\s+"
+      ]
+    }
+  }
+}

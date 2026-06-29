@@ -1,0 +1,1410 @@
+# Makefile for DeepIntShield
+
+# Variables
+HOST ?= localhost
+PORT ?= 8080
+APP_DIR ?=
+PROMETHEUS_LABELS ?=
+LOG_STYLE ?= json
+LOG_LEVEL ?= info
+TEST_REPORTS_DIR ?= test-reports
+GOTESTSUM_FORMAT ?= standard-verbose
+FLOW ?=
+VERSION ?= dev-build
+LOCAL ?=
+DEBUG ?=
+
+# When a local go.work exists, prefer it automatically for source builds.
+USE_LOCAL_WORKSPACE := $(if $(LOCAL),1,$(if $(wildcard go.work),1,))
+GO_WORK_TOGGLE := $(if $(USE_LOCAL_WORKSPACE),,GOWORK=off)
+GO_BIN_DIR := $(or $(shell go env GOBIN),$(shell go env GOPATH)/bin)
+AIR_BIN := $(if $(shell command -v air 2>/dev/null),$(shell command -v air 2>/dev/null),$(GO_BIN_DIR)/air)
+DLV_BIN := $(if $(shell command -v dlv 2>/dev/null),$(shell command -v dlv 2>/dev/null),$(GO_BIN_DIR)/dlv)
+
+# Colors for output
+RED=\033[0;31m
+GREEN=\033[0;32m
+YELLOW=\033[1;33m
+BLUE=\033[0;34m
+CYAN=\033[0;36m
+NC=\033[0m # No Color
+
+.PHONY: all help dev build-ui build build-cli run run-cli install-air clean test test-cli install-ui setup-workspace work-init work-clean docs docker-image docker-run cleanup-enterprise mod-tidy test-integrations-py test-integrations-ts install-playwright run-e2e run-e2e-ui run-e2e-headed
+
+all: help
+
+# Default target
+help: ## Show this help message
+	@echo "$(BLUE)DeepIntShield Development - Available Commands:$(NC)"
+	@echo ""
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-15s$(NC) %s\n", $$1, $$2}'
+	@echo ""
+	@echo "$(YELLOW)Environment Variables:$(NC)"
+	@echo "  HOST              Server host (default: localhost)"
+	@echo "  PORT              Server port (default: 8080)"
+	@echo "  PROMETHEUS_LABELS Labels for Prometheus metrics"
+	@echo "  LOG_STYLE         Logger output format: json|pretty (default: json)"
+	@echo "  LOG_LEVEL         Logger level: debug|info|warn|error (default: info)"
+	@echo "  APP_DIR           App data directory inside container (default: /app/data)"
+	@echo "  LOCAL             Use local go.work for builds (e.g., make build LOCAL=1)"
+	@echo "  DEBUG             Enable delve debugger on port 2345 (e.g., make dev DEBUG=1, make test-core DEBUG=1, make test-governance DEBUG=1)"
+	@echo ""
+	@echo "$(YELLOW)Test Configuration:$(NC)"
+	@echo "  TEST_REPORTS_DIR  Directory for HTML test reports (default: test-reports)"
+	@echo "  GOTESTSUM_FORMAT  Test output format: testname|dots|pkgname|standard-verbose (default: standard-verbose)"
+	@echo "  TESTCASE          Exact test name to run (e.g., TestVirtualKeyTokenRateLimit)"
+	@echo "  PATTERN           Substring pattern to filter tests (alternative to TESTCASE)"
+	@echo "  FLOW              E2E test flow to run: providers|virtual-keys (default: all)"
+
+cleanup-enterprise: ## Clean up enterprise directories if present
+	@echo "$(GREEN)Cleaning up enterprise...$(NC)"
+	@if [ -d "ui/app/enterprise" ]; then rm -rf ui/app/enterprise; fi
+	@echo "$(GREEN)Enterprise cleaned up$(NC)"
+
+install-ui: cleanup-enterprise
+	@which node > /dev/null || (echo "$(RED)Error: Node.js is not installed. Please install Node.js first.$(NC)" && exit 1)
+	@which npm > /dev/null || (echo "$(RED)Error: npm is not installed. Please install npm first.$(NC)" && exit 1)
+	@echo "$(GREEN)Node.js and npm are installed$(NC)"
+	@cd ui && npm install
+	@which next > /dev/null || (echo "$(YELLOW)Installing nextjs...$(NC)" && npm install -g next)
+	@echo "$(GREEN)UI deps are in sync$(NC)"
+
+install-air: ## Install air for hot reloading (if not already installed)
+	@which air > /dev/null || (echo "$(YELLOW)Installing air for hot reloading...$(NC)" && go install github.com/air-verse/air@latest)
+	@if [ ! -x "$(AIR_BIN)" ]; then \
+		echo "$(RED)Error: air was not found after installation. Expected at $(AIR_BIN)$(NC)"; \
+		echo "$(YELLOW)Add $(GO_BIN_DIR) to your PATH or run: export PATH=\"$(GO_BIN_DIR):$$PATH\"$(NC)"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)Air is ready at $(AIR_BIN)$(NC)"
+
+install-delve: ## Install delve for debugging (if not already installed)
+	@which dlv > /dev/null || (echo "$(YELLOW)Installing delve for debugging...$(NC)" && go install github.com/go-delve/delve/cmd/dlv@latest)
+	@if [ ! -x "$(DLV_BIN)" ]; then \
+		echo "$(RED)Error: dlv was not found after installation. Expected at $(DLV_BIN)$(NC)"; \
+		echo "$(YELLOW)Add $(GO_BIN_DIR) to your PATH or run: export PATH=\"$(GO_BIN_DIR):$$PATH\"$(NC)"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)Delve is ready at $(DLV_BIN)$(NC)"
+
+install-gotestsum: ## Install gotestsum for test reporting (if not already installed)
+	@which gotestsum > /dev/null || (echo "$(YELLOW)Installing gotestsum for test reporting...$(NC)" && go install gotest.tools/gotestsum@latest)
+	@echo "$(GREEN)gotestsum is ready$(NC)"
+
+install-junit-viewer: ## Install junit-viewer for HTML report generation (if not already installed)
+	@if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+		if which junit-viewer > /dev/null 2>&1; then \
+			echo "$(GREEN)junit-viewer is already installed$(NC)"; \
+		else \
+			echo "$(YELLOW)Installing junit-viewer for HTML reports...$(NC)"; \
+			if npm install -g junit-viewer 2>&1; then \
+				echo "$(GREEN)junit-viewer installed successfully$(NC)"; \
+			else \
+				echo "$(RED)Failed to install junit-viewer. HTML reports will be skipped.$(NC)"; \
+				echo "$(YELLOW)You can install it manually: npm install -g junit-viewer$(NC)"; \
+				exit 0; \
+			fi; \
+		fi; \
+	else \
+		echo "$(YELLOW)CI environment detected, skipping junit-viewer installation$(NC)"; \
+	fi
+
+dev: install-ui install-air setup-workspace $(if $(DEBUG),install-delve) ## Start complete development environment (UI + API with proxy)
+	@echo "$(GREEN)Starting DeepIntShield complete development environment...$(NC)"
+	@echo "$(YELLOW)This will start:$(NC)"
+	@echo "  1. UI development server (localhost:3000)"
+	@echo "  2. API server with UI proxy (localhost:$(PORT))"
+	@echo "$(CYAN)Access everything at: http://localhost:$(PORT)$(NC)"
+	@if [ -n "$(DEBUG)" ]; then \
+		echo "$(CYAN)  3. Debugger (delve) listening on port 2345$(NC)"; \
+	fi
+	@if [ ! -d "transports/deepintshield-http/ui" ]; then \
+		echo "$(YELLOW)Creating transports/deepintshield-http/ui directory...$(NC)"; \
+		mkdir -p transports/deepintshield-http/ui; \
+		touch transports/deepintshield-http/ui/.tmp; \
+	fi
+	@echo ""
+	@echo "$(YELLOW)Starting UI development server...$(NC)"
+	@if [ -n "$(DISABLE_PROFILER)" ]; then \
+		echo "$(CYAN)DevProfiler disabled for testing$(NC)"; \
+		cd ui && NEXT_PUBLIC_DISABLE_PROFILER=1 npm run dev & \
+	else \
+		cd ui && npm run dev & \
+	fi
+	@sleep 3
+	@echo "$(YELLOW)Starting API server with UI proxy...$(NC)"
+	@$(MAKE) setup-workspace >/dev/null
+	@if [ -f .env ]; then \
+		echo "$(YELLOW)Loading environment variables from .env...$(NC)"; \
+		set -a; . ./.env; set +a; \
+	fi; \
+	if [ -n "$(DEBUG)" ]; then \
+		echo "$(CYAN)Starting with air + delve debugger on port 2345...$(NC)"; \
+		echo "$(YELLOW)Attach your debugger to localhost:2345$(NC)"; \
+		cd transports/deepintshield-http && DEEPINTSHIELD_UI_DEV=true "$(AIR_BIN)" -c .air.debug.toml -- \
+			-host "$(HOST)" \
+			-port "$(PORT)" \
+			-log-style "$(LOG_STYLE)" \
+			-log-level "$(LOG_LEVEL)" \
+			$(if $(PROMETHEUS_LABELS),-prometheus-labels "$(PROMETHEUS_LABELS)") \
+			$(if $(APP_DIR),-app-dir "$(APP_DIR)"); \
+	else \
+		cd transports/deepintshield-http && DEEPINTSHIELD_UI_DEV=true "$(AIR_BIN)" -c .air.toml -- \
+			-host "$(HOST)" \
+			-port "$(PORT)" \
+			-log-style "$(LOG_STYLE)" \
+			-log-level "$(LOG_LEVEL)" \
+			$(if $(PROMETHEUS_LABELS),-prometheus-labels "$(PROMETHEUS_LABELS)") \
+			$(if $(APP_DIR),-app-dir "$(APP_DIR)"); \
+	fi
+
+build-ui: install-ui ## Build ui
+	@echo "$(GREEN)Building ui...$(NC)"
+	@rm -rf ui/.next
+	@cd ui && npm run build && npm run copy-build
+
+build: build-ui ## Build deepintshield-http binary
+	@if [ -n "$(LOCAL)" ]; then \
+		echo "$(GREEN)╔═══════════════════════════════════════════════╗$(NC)"; \
+		echo "$(GREEN)║  Building deepintshield-http with local go.work...  ║$(NC)"; \
+		echo "$(GREEN)╚═══════════════════════════════════════════════╝$(NC)"; \
+	elif [ -n "$(USE_LOCAL_WORKSPACE)" ]; then \
+		echo "$(GREEN)╔══════════════════════════════════════════════════════╗$(NC)"; \
+		echo "$(GREEN)║  Building deepintshield-http with detected local go.work... ║$(NC)"; \
+		echo "$(GREEN)╚══════════════════════════════════════════════════════╝$(NC)"; \
+	else \
+		echo "$(GREEN)╔═══════════════════════════════════════╗$(NC)"; \
+		echo "$(GREEN)║  Building deepintshield-http...             ║$(NC)"; \
+		echo "$(GREEN)╚═══════════════════════════════════════╝$(NC)"; \
+	fi
+	@if [ -n "$(DYNAMIC)" ]; then \
+		echo "$(YELLOW)Note: This will create a dynamically linked build.$(NC)"; \
+	else \
+		echo "$(YELLOW)Note: This will create a statically linked build.$(NC)"; \
+	fi
+	@mkdir -p ./tmp
+	@set -e; \
+	TARGET_OS="$(GOOS)"; \
+	TARGET_ARCH="$(GOARCH)"; \
+	ACTUAL_OS=$$(uname -s | tr '[:upper:]' '[:lower:]' | sed 's/darwin/darwin/;s/linux/linux/;s/mingw.*/windows/'); \
+	ACTUAL_ARCH=$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/;s/arm64/arm64/'); \
+	if [ -z "$$TARGET_OS" ]; then \
+		TARGET_OS=$$ACTUAL_OS; \
+	fi; \
+	if [ -z "$$TARGET_ARCH" ]; then \
+		TARGET_ARCH=$$ACTUAL_ARCH; \
+	fi; \
+	HOST_OS=$$ACTUAL_OS; \
+	HOST_ARCH=$$ACTUAL_ARCH; \
+	echo "$(CYAN)Host: $$HOST_OS/$$HOST_ARCH | Target: $$TARGET_OS/$$TARGET_ARCH$(NC)"; \
+	if [ "$$TARGET_OS" = "linux" ] && [ "$$HOST_OS" = "linux" ]; then \
+		if [ -n "$(DYNAMIC)" ]; then \
+			echo "$(CYAN)Building for $$TARGET_OS/$$TARGET_ARCH with dynamic linking...$(NC)"; \
+			cd transports/deepintshield-http && CGO_ENABLED=1 GOOS=$$TARGET_OS GOARCH=$$TARGET_ARCH $(GO_WORK_TOGGLE) go build \
+				-ldflags="-w -s -X main.Version=v$(VERSION)" \
+				-a -trimpath \
+				-o ../../tmp/deepintshield-http \
+				.; \
+		else \
+			echo "$(CYAN)Building for $$TARGET_OS/$$TARGET_ARCH with static linking...$(NC)"; \
+			cd transports/deepintshield-http && CGO_ENABLED=1 GOOS=$$TARGET_OS GOARCH=$$TARGET_ARCH $(GO_WORK_TOGGLE) go build \
+				-ldflags="-w -s -extldflags "-static" -X main.Version=v$(VERSION)" \
+				-a -trimpath \
+				-tags "sqlite_static" \
+				-o ../../tmp/deepintshield-http \
+				.; \
+		fi; \
+		echo "$(GREEN)Built: tmp/deepintshield-http (version: v$(VERSION))$(NC)"; \
+	elif [ "$$TARGET_OS" = "$$HOST_OS" ] && [ "$$TARGET_ARCH" = "$$HOST_ARCH" ]; then \
+		echo "$(CYAN)Building for $$TARGET_OS/$$TARGET_ARCH (native build with CGO)...$(NC)"; \
+		cd transports/deepintshield-http && CGO_ENABLED=1 GOOS=$$TARGET_OS GOARCH=$$TARGET_ARCH $(GO_WORK_TOGGLE) go build \
+			-ldflags="-w -s -X main.Version=v$(VERSION)" \
+			-a -trimpath \
+			-tags "sqlite_static" \
+			-o ../../tmp/deepintshield-http \
+			.; \
+		echo "$(GREEN)Built: tmp/deepintshield-http (version: v$(VERSION))$(NC)"; \
+	else \
+		echo "$(YELLOW)Cross-compilation detected: $$HOST_OS/$$HOST_ARCH -> $$TARGET_OS/$$TARGET_ARCH$(NC)"; \
+		echo "$(CYAN)Using Docker for cross-compilation...$(NC)"; \
+		$(MAKE) _build-with-docker TARGET_OS=$$TARGET_OS TARGET_ARCH=$$TARGET_ARCH $(if $(DYNAMIC),DYNAMIC=$(DYNAMIC)); \
+	fi
+
+build-cli: ## Build deepintshield CLI binary
+	@echo "$(GREEN)Building deepintshield CLI...$(NC)"
+	@mkdir -p ./tmp
+	@cd cli && $(GO_WORK_TOGGLE) go build -ldflags "-X main.version=v0.1.1-dev" -o ../tmp/deepintshield .
+	@echo "$(GREEN)Built: tmp/deepintshield$(NC)"
+
+_build-with-docker: # Internal target for Docker-based cross-compilation
+	@echo "$(CYAN)Using Docker for cross-compilation...$(NC)"; \
+	if [ "$(TARGET_OS)" = "linux" ]; then \
+		if [ -n "$(DYNAMIC)" ]; then \
+			echo "$(CYAN)Building for $(TARGET_OS)/$(TARGET_ARCH) in Docker container with dynamic linking...$(NC)"; \
+			docker run --rm \
+				--platform linux/$(TARGET_ARCH) \
+				-v "$(shell pwd):/workspace" \
+				-w /workspace/transports/deepintshield-http \
+				-e CGO_ENABLED=1 \
+				-e GOOS=$(TARGET_OS) \
+				-e GOARCH=$(TARGET_ARCH) \
+				 $(if $(USE_LOCAL_WORKSPACE),,-e GOWORK=off) \
+				golang:1.26.1-alpine3.23 \
+				sh -c "apk add --no-cache gcc musl-dev && \
+				go build \
+					-ldflags='-w -s -X main.Version=v$(VERSION)' \
+					-a -trimpath \
+					-o ../../tmp/deepintshield-http \
+					."; \
+		else \
+			echo "$(CYAN)Building for $(TARGET_OS)/$(TARGET_ARCH) in Docker container...$(NC)"; \
+			docker run --rm \
+				--platform linux/$(TARGET_ARCH) \
+				-v "$(shell pwd):/workspace" \
+				-w /workspace/transports/deepintshield-http \
+				-e CGO_ENABLED=1 \
+				-e GOOS=$(TARGET_OS) \
+				-e GOARCH=$(TARGET_ARCH) \
+				 $(if $(USE_LOCAL_WORKSPACE),,-e GOWORK=off) \
+				golang:1.26.1-alpine3.23 \
+				sh -c "apk add --no-cache gcc musl-dev && \
+				go build \
+					-ldflags='-w -s -extldflags "-static" -X main.Version=v$(VERSION)' \
+					-a -trimpath \
+					-tags sqlite_static \
+					-o ../../tmp/deepintshield-http \
+					."; \
+		fi; \
+		echo "$(GREEN)Built: tmp/deepintshield-http ($(TARGET_OS)/$(TARGET_ARCH), version: v$(VERSION))$(NC)"; \
+	else \
+		echo "$(RED)Error: Docker cross-compilation only supports Linux targets$(NC)"; \
+		echo "$(YELLOW)For $(TARGET_OS), please build on a native $(TARGET_OS) machine$(NC)"; \
+		exit 1; \
+	fi
+
+docker-image: build-ui ## Build Docker image
+	@echo "$(GREEN)Building Docker image...$(NC)"
+	$(eval GIT_SHA=$(shell git rev-parse --short HEAD))
+	@docker build -f transports/Dockerfile -t deepintshield -t deepintshield:$(GIT_SHA) -t deepintshield:latest .
+	@echo "$(GREEN)Docker image built: deepintshield, deepintshield:$(GIT_SHA), deepintshield:latest$(NC)"
+
+docker-run: ## Run Docker container
+	@echo "$(GREEN)Running Docker container...$(NC)"
+	@docker run -e APP_PORT=$(PORT) -e APP_HOST=0.0.0.0 -p $(PORT):$(PORT) -e LOG_LEVEL=$(LOG_LEVEL) -e LOG_STYLE=$(LOG_STYLE) -v $(shell pwd):/app/data  deepintshield
+
+docs: ## Prepare local docs
+	@echo "$(GREEN)Preparing local docs...$(NC)"
+	@cd docs && npx --yes mintlify@latest dev
+
+run: build ## Build and run deepintshield-http (no hot reload)
+	@echo "$(GREEN)Running deepintshield-http...$(NC)"
+	@./tmp/deepintshield-http \
+		-host "$(HOST)" \
+		-port "$(PORT)" \
+		-log-style "$(LOG_STYLE)" \
+		-log-level "$(LOG_LEVEL)" \
+		$(if $(PROMETHEUS_LABELS),-prometheus-labels "$(PROMETHEUS_LABELS)") \
+		$(if $(APP_DIR),-app-dir "$(APP_DIR)")
+
+run-cli: build-cli ## Run deepintshield CLI (Usage: make run-cli [ARGS="--config ~/.deepintshield/config.json"])
+	@echo "$(GREEN)Running deepintshield CLI...$(NC)"
+	@./tmp/deepintshield $(ARGS)
+
+clean: ## Clean build artifacts and temporary files
+	@echo "$(YELLOW)Cleaning build artifacts...$(NC)"
+	@rm -rf tmp/
+	@rm -f transports/deepintshield-http/build-errors.log
+	@rm -rf transports/deepintshield-http/tmp/
+	@rm -rf $(TEST_REPORTS_DIR)/
+	@echo "$(GREEN)Clean complete$(NC)"
+
+clean-test-reports: ## Clean test reports only
+	@echo "$(YELLOW)Cleaning test reports...$(NC)"
+	@rm -rf $(TEST_REPORTS_DIR)/
+	@echo "$(GREEN)Test reports cleaned$(NC)"
+
+generate-html-reports: ## Convert existing XML reports to HTML
+	@if ! which junit-viewer > /dev/null 2>&1; then \
+		echo "$(RED)Error: junit-viewer not installed$(NC)"; \
+		echo "$(YELLOW)Install with: make install-junit-viewer$(NC)"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)Converting XML reports to HTML...$(NC)"
+	@if [ ! -d "$(TEST_REPORTS_DIR)" ] || [ -z "$$(ls -A $(TEST_REPORTS_DIR)/*.xml 2>/dev/null)" ]; then \
+		echo "$(YELLOW)No XML reports found in $(TEST_REPORTS_DIR)$(NC)"; \
+		echo "$(YELLOW)Run tests first: make test-all$(NC)"; \
+		exit 0; \
+	fi
+	@for xml in $(TEST_REPORTS_DIR)/*.xml; do \
+		html=$${xml%.xml}.html; \
+		echo "  Converting $$(basename $$xml) → $$(basename $$html)"; \
+		junit-viewer --results=$$xml --save=$$html 2>/dev/null || true; \
+	done
+	@echo ""
+	@echo "$(GREEN)✓ HTML reports generated$(NC)"
+	@echo "$(CYAN)View reports:$(NC)"
+	@ls -1 $(TEST_REPORTS_DIR)/*.html 2>/dev/null | sed 's|$(TEST_REPORTS_DIR)/|  open $(TEST_REPORTS_DIR)/|' || true
+
+test: install-gotestsum ## Run tests for deepintshield-http
+	@echo "$(GREEN)Running deepintshield-http tests...$(NC)"
+	@mkdir -p $(TEST_REPORTS_DIR)
+	@cd transports/deepintshield-http && GOWORK=off gotestsum \
+		--format=$(GOTESTSUM_FORMAT) \
+		--junitfile=../../$(TEST_REPORTS_DIR)/deepintshield-http.xml \
+		-- -v ./...
+	@if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+		if which junit-viewer > /dev/null 2>&1; then \
+			echo "$(YELLOW)Generating HTML report...$(NC)"; \
+			if junit-viewer --results=$(TEST_REPORTS_DIR)/deepintshield-http.xml --save=$(TEST_REPORTS_DIR)/deepintshield-http.html 2>/dev/null; then \
+				echo ""; \
+				echo "$(CYAN)HTML report: $(TEST_REPORTS_DIR)/deepintshield-http.html$(NC)"; \
+				echo "$(CYAN)Open with: open $(TEST_REPORTS_DIR)/deepintshield-http.html$(NC)"; \
+			else \
+				echo "$(YELLOW)HTML generation failed. JUnit XML report available.$(NC)"; \
+				echo "$(CYAN)JUnit XML report: $(TEST_REPORTS_DIR)/deepintshield-http.xml$(NC)"; \
+			fi; \
+		else \
+			echo ""; \
+			echo "$(YELLOW)junit-viewer not installed. Install with: make install-junit-viewer$(NC)"; \
+			echo "$(CYAN)JUnit XML report: $(TEST_REPORTS_DIR)/deepintshield-http.xml$(NC)"; \
+		fi; \
+	else \
+		echo ""; \
+		echo "$(CYAN)JUnit XML report: $(TEST_REPORTS_DIR)/deepintshield-http.xml$(NC)"; \
+	fi
+
+test-core: install-gotestsum $(if $(DEBUG),install-delve) ## Run core tests (Usage: make test-core PROVIDER=openai TESTCASE=TestName or PATTERN=substring, DEBUG=1 for debugger)
+	@echo "$(GREEN)Running core tests...$(NC)"
+	@mkdir -p $(TEST_REPORTS_DIR)
+	@if [ -n "$(PATTERN)" ] && [ -n "$(TESTCASE)" ]; then \
+		echo "$(RED)Error: PATTERN and TESTCASE are mutually exclusive$(NC)"; \
+		echo "$(YELLOW)Use PATTERN for substring matching or TESTCASE for exact match$(NC)"; \
+		exit 1; \
+	fi
+	@TEST_FAILED=0; \
+	REPORT_FILE=""; \
+	if [ -n "$(PROVIDER)" ]; then \
+		echo "$(CYAN)Running tests for provider: $(PROVIDER)$(NC)"; \
+		if [ ! -f "core/providers/$(PROVIDER)/$(PROVIDER)_test.go" ]; then \
+			echo "$(RED)Error: Provider test file '$(PROVIDER)_test.go' not found in core/providers/$(PROVIDER)/$(NC)"; \
+			echo "$(YELLOW)Available providers:$(NC)"; \
+			find core/providers -name "*_test.go" -type f 2>/dev/null | sed 's|core/providers/\([^/]*\)/.*|\1|' | sort -u | sed 's/^/  - /'; \
+			exit 1; \
+		fi; \
+	fi; \
+	if [ -f .env ]; then \
+		echo "$(YELLOW)Loading environment variables from .env...$(NC)"; \
+		set -a; . ./.env; set +a; \
+	fi; \
+	if [ -n "$(DEBUG)" ]; then \
+		echo "$(CYAN)Debug mode enabled - delve debugger will listen on port 2345$(NC)"; \
+		echo "$(YELLOW)Attach your debugger to localhost:2345$(NC)"; \
+	fi; \
+	if [ -n "$(PROVIDER)" ]; then \
+		PROVIDER_TEST_NAME=$$(echo "$(PROVIDER)" | awk '{print toupper(substr($$0,1,1)) tolower(substr($$0,2))}' | sed 's/openai/OpenAI/i; s/sgl/SGL/i'); \
+		if [ -n "$(TESTCASE)" ]; then \
+			CLEAN_TESTCASE="$(TESTCASE)"; \
+			CLEAN_TESTCASE=$${CLEAN_TESTCASE#Test$${PROVIDER_TEST_NAME}/}; \
+			CLEAN_TESTCASE=$${CLEAN_TESTCASE#$${PROVIDER_TEST_NAME}Tests/}; \
+			CLEAN_TESTCASE=$$(echo "$$CLEAN_TESTCASE" | sed 's|^Test[A-Z][A-Za-z]*/[A-Z][A-Za-z]*Tests/||'); \
+			echo "$(CYAN)Running Test$${PROVIDER_TEST_NAME}/$${PROVIDER_TEST_NAME}Tests/$$CLEAN_TESTCASE...$(NC)"; \
+			REPORT_FILE="$(TEST_REPORTS_DIR)/core-$(PROVIDER)-$$(echo $$CLEAN_TESTCASE | sed 's|/|_|g').xml"; \
+			if [ -n "$(DEBUG)" ]; then \
+				cd core/providers/$(PROVIDER) && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run "^Test$${PROVIDER_TEST_NAME}$$/.*Tests/$$CLEAN_TESTCASE$$" || TEST_FAILED=1; \
+			else \
+				cd core/providers/$(PROVIDER) && GOWORK=off gotestsum \
+					--format=$(GOTESTSUM_FORMAT) \
+					--junitfile=../../../$$REPORT_FILE \
+					-- -v -timeout 20m -run "^Test$${PROVIDER_TEST_NAME}$$/.*Tests/$$CLEAN_TESTCASE$$" || TEST_FAILED=1; \
+			fi; \
+			cd ../../..; \
+			$(MAKE) cleanup-junit-xml REPORT_FILE=$$REPORT_FILE; \
+			if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+				if which junit-viewer > /dev/null 2>&1; then \
+					echo "$(YELLOW)Generating HTML report...$(NC)"; \
+					junit-viewer --results=$$REPORT_FILE --save=$${REPORT_FILE%.xml}.html 2>/dev/null || true; \
+					echo ""; \
+					echo "$(CYAN)HTML report: $${REPORT_FILE%.xml}.html$(NC)"; \
+					echo "$(CYAN)Open with: open $${REPORT_FILE%.xml}.html$(NC)"; \
+				else \
+					echo ""; \
+					echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+				fi; \
+			else \
+				echo ""; \
+				echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+			fi; \
+		elif [ -n "$(PATTERN)" ]; then \
+			echo "$(CYAN)Running tests matching '$(PATTERN)' for $${PROVIDER_TEST_NAME}...$(NC)"; \
+			REPORT_FILE="$(TEST_REPORTS_DIR)/core-$(PROVIDER)-$(PATTERN).xml"; \
+			if [ -n "$(DEBUG)" ]; then \
+				cd core/providers/$(PROVIDER) && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run ".*$(PATTERN).*" || TEST_FAILED=1; \
+			else \
+				cd core/providers/$(PROVIDER) && GOWORK=off gotestsum \
+					--format=$(GOTESTSUM_FORMAT) \
+					--junitfile=../../../$$REPORT_FILE \
+					-- -v -timeout 20m -run ".*$(PATTERN).*" || TEST_FAILED=1; \
+			fi; \
+			cd ../../..; \
+			$(MAKE) cleanup-junit-xml REPORT_FILE=$$REPORT_FILE; \
+			if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+				if which junit-viewer > /dev/null 2>&1; then \
+					echo "$(YELLOW)Generating HTML report...$(NC)"; \
+					junit-viewer --results=$$REPORT_FILE --save=$${REPORT_FILE%.xml}.html 2>/dev/null || true; \
+					echo ""; \
+					echo "$(CYAN)HTML report: $${REPORT_FILE%.xml}.html$(NC)"; \
+					echo "$(CYAN)Open with: open $${REPORT_FILE%.xml}.html$(NC)"; \
+				else \
+					echo ""; \
+					echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+				fi; \
+			else \
+				echo ""; \
+				echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+			fi; \
+		else \
+			echo "$(CYAN)Running Test$${PROVIDER_TEST_NAME}...$(NC)"; \
+			REPORT_FILE="$(TEST_REPORTS_DIR)/core-$(PROVIDER).xml"; \
+			if [ -n "$(DEBUG)" ]; then \
+				cd core/providers/$(PROVIDER) && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run "^Test$${PROVIDER_TEST_NAME}$$" || TEST_FAILED=1; \
+			else \
+				cd core/providers/$(PROVIDER) && GOWORK=off gotestsum \
+					--format=$(GOTESTSUM_FORMAT) \
+					--junitfile=../../../$$REPORT_FILE \
+					-- -v -timeout 20m -run "^Test$${PROVIDER_TEST_NAME}$$" || TEST_FAILED=1; \
+			fi; \
+			cd ../../..; \
+			$(MAKE) cleanup-junit-xml REPORT_FILE=$$REPORT_FILE; \
+			if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+				if which junit-viewer > /dev/null 2>&1; then \
+					echo "$(YELLOW)Generating HTML report...$(NC)"; \
+					junit-viewer --results=$$REPORT_FILE --save=$${REPORT_FILE%.xml}.html 2>/dev/null || true; \
+					echo ""; \
+					echo "$(CYAN)HTML report: $${REPORT_FILE%.xml}.html$(NC)"; \
+					echo "$(CYAN)Open with: open $${REPORT_FILE%.xml}.html$(NC)"; \
+				else \
+					echo ""; \
+					echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+				fi; \
+			else \
+				echo ""; \
+				echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+			fi; \
+		fi; \
+	else \
+		if [ -n "$(TESTCASE)" ]; then \
+			echo "$(RED)Error: TESTCASE requires PROVIDER to be specified$(NC)"; \
+			echo "$(YELLOW)Usage: make test-core PROVIDER=openai TESTCASE=SpeechSynthesisStreamAdvanced/MultipleVoices_Streaming/StreamingVoice_echo$(NC)"; \
+			exit 1; \
+		fi; \
+		if [ -n "$(PATTERN)" ]; then \
+			echo "$(CYAN)Running tests matching '$(PATTERN)' across all providers...$(NC)"; \
+			REPORT_FILE="$(TEST_REPORTS_DIR)/core-all-$(PATTERN).xml"; \
+			if [ -n "$(DEBUG)" ]; then \
+				cd core && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 ./providers/... -- -test.v -test.run ".*$(PATTERN).*" || TEST_FAILED=1; \
+			else \
+				cd core && GOWORK=off gotestsum \
+					--format=$(GOTESTSUM_FORMAT) \
+					--junitfile=../$$REPORT_FILE \
+					-- -v -timeout 20m -run ".*$(PATTERN).*" ./providers/... || TEST_FAILED=1; \
+			fi; \
+		else \
+			REPORT_FILE="$(TEST_REPORTS_DIR)/core-all.xml"; \
+			if [ -n "$(DEBUG)" ]; then \
+				cd core && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 ./providers/... -- -test.v || TEST_FAILED=1; \
+			else \
+				cd core && GOWORK=off gotestsum \
+					--format=$(GOTESTSUM_FORMAT) \
+					--junitfile=../$$REPORT_FILE \
+					-- -v ./providers/... || TEST_FAILED=1; \
+			fi; \
+		fi; \
+		cd ..; \
+		$(MAKE) cleanup-junit-xml REPORT_FILE=$$REPORT_FILE; \
+		if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+			if which junit-viewer > /dev/null 2>&1; then \
+				echo "$(YELLOW)Generating HTML report...$(NC)"; \
+				junit-viewer --results=$$REPORT_FILE --save=$${REPORT_FILE%.xml}.html 2>/dev/null || true; \
+				echo ""; \
+				echo "$(CYAN)HTML report: $${REPORT_FILE%.xml}.html$(NC)"; \
+				echo "$(CYAN)Open with: open $${REPORT_FILE%.xml}.html$(NC)"; \
+			else \
+				echo ""; \
+				echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+			fi; \
+		else \
+			echo ""; \
+			echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+		fi; \
+	fi; \
+	if [ -f "$$REPORT_FILE" ]; then \
+		ALL_FAILED=$$(grep -B 1 '<failure' "$$REPORT_FILE" 2>/dev/null | \
+			grep '<testcase' | \
+			sed 's/.*name="\([^"]*\)".*/\1/' | \
+			sort -u); \
+		MAX_DEPTH=$$(echo "$$ALL_FAILED" | awk -F'/' '{print NF}' | sort -n | tail -1); \
+		FAILED_TESTS=$$(echo "$$ALL_FAILED" | awk -F'/' -v max="$$MAX_DEPTH" 'NF == max'); \
+		FAILURES=$$(echo "$$FAILED_TESTS" | grep -v '^$$' | wc -l | tr -d ' '); \
+		if [ "$$FAILURES" -gt 0 ]; then \
+			echo ""; \
+			echo "$(RED)═══════════════════════════════════════════════════════════$(NC)"; \
+			echo "$(RED)                    FAILED TEST CASES                      $(NC)"; \
+			echo "$(RED)═══════════════════════════════════════════════════════════$(NC)"; \
+			echo ""; \
+			printf "$(YELLOW)%-60s %-20s$(NC)\n" "Test Name" "Status"; \
+			printf "$(YELLOW)%-60s %-20s$(NC)\n" "─────────────────────────────────────────────────────────────" "────────────────────"; \
+			echo "$$FAILED_TESTS" | while read -r testname; do \
+				if [ -n "$$testname" ]; then \
+					printf "$(RED)%-60s %-20s$(NC)\n" "$$testname" "FAILED"; \
+				fi; \
+			done; \
+			echo ""; \
+			echo "$(RED)Total Failures: $$FAILURES$(NC)"; \
+			echo ""; \
+		else \
+			echo ""; \
+			echo "$(GREEN)═══════════════════════════════════════════════════════════$(NC)"; \
+			echo "$(GREEN)                 ALL TESTS PASSED ✓                       $(NC)"; \
+			echo "$(GREEN)═══════════════════════════════════════════════════════════$(NC)"; \
+			echo ""; \
+		fi; \
+	fi; \
+	if [ $$TEST_FAILED -eq 1 ]; then \
+		exit 1; \
+	fi
+
+cleanup-junit-xml: ## Internal: Clean up JUnit XML to remove parent test cases with child failures
+	@if [ -z "$(REPORT_FILE)" ]; then \
+		echo "$(RED)Error: REPORT_FILE not specified$(NC)"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(REPORT_FILE)" ]; then \
+		exit 0; \
+	fi
+	@ALL_FAILED=$$(grep -B 1 '<failure' "$(REPORT_FILE)" 2>/dev/null | \
+		grep '<testcase' | \
+		sed 's/.*name="\([^"]*\)".*/\1/' | \
+		sort -u); \
+	if [ -n "$$ALL_FAILED" ]; then \
+		MAX_DEPTH=$$(echo "$$ALL_FAILED" | awk -F'/' '{print NF}' | sort -n | tail -1); \
+		PARENT_TESTS=$$(echo "$$ALL_FAILED" | awk -F'/' -v max="$$MAX_DEPTH" 'NF < max'); \
+		if [ -n "$$PARENT_TESTS" ]; then \
+			cp "$(REPORT_FILE)" "$(REPORT_FILE).tmp"; \
+			echo "$$PARENT_TESTS" | while IFS= read -r parent; do \
+				if [ -n "$$parent" ]; then \
+					ESCAPED=$$(echo "$$parent" | sed 's/[\/&]/\\&/g'); \
+					perl -i -pe 'BEGIN{undef $$/;} s/<testcase[^>]*name="'"$$ESCAPED"'"[^>]*>.*?<failure.*?<\/testcase>//gs' "$(REPORT_FILE).tmp" 2>/dev/null || true; \
+				fi; \
+			done; \
+			if [ -f "$(REPORT_FILE).tmp" ]; then \
+				mv "$(REPORT_FILE).tmp" "$(REPORT_FILE)"; \
+			fi; \
+		fi; \
+	fi
+
+test-plugins: install-gotestsum ## Run plugin tests
+	@echo "$(GREEN)Running plugin tests...$(NC)"
+	@mkdir -p $(TEST_REPORTS_DIR)
+	@if [ -f .env ]; then \
+		echo "$(YELLOW)Loading environment variables from .env...$(NC)"; \
+		set -a; . ./.env; set +a; \
+	fi; \
+	cd plugins && find . -name "*.go" -path "*/tests/*" -o -name "*_test.go" | head -1 > /dev/null && \
+		for dir in $$(find . -name "*_test.go" -exec dirname {} \; | sort -u); do \
+			plugin_name=$$(echo $$dir | sed 's|^\./||' | sed 's|/|-|g'); \
+			echo "Testing $$dir..."; \
+			cd $$dir && gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../$(TEST_REPORTS_DIR)/plugin-$$plugin_name.xml \
+				-- -v ./... && cd - > /dev/null; \
+			if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+				if which junit-viewer > /dev/null 2>&1; then \
+					echo "$(YELLOW)Generating HTML report for $$plugin_name...$(NC)"; \
+					junit-viewer --results=../$(TEST_REPORTS_DIR)/plugin-$$plugin_name.xml --save=../$(TEST_REPORTS_DIR)/plugin-$$plugin_name.html 2>/dev/null || true; \
+				fi; \
+			fi; \
+		done || echo "No plugin tests found"
+	@echo ""
+	@if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+		echo "$(CYAN)HTML reports saved to $(TEST_REPORTS_DIR)/plugin-*.html$(NC)"; \
+	else \
+		echo "$(CYAN)JUnit XML reports saved to $(TEST_REPORTS_DIR)/plugin-*.xml$(NC)"; \
+	fi
+
+test-framework: install-gotestsum ## Run framework tests
+	@echo "$(GREEN)Running framework tests...$(NC)"
+	@mkdir -p $(TEST_REPORTS_DIR)
+	@if [ -f .env ]; then \
+		echo "$(YELLOW)Loading environment variables from .env...$(NC)"; \
+		set -a; . ./.env; set +a; \
+	fi; \
+	cd framework && find . -name "*.go" -path "*/tests/*" -o -name "*_test.go" | head -1 > /dev/null && \
+		for dir in $$(find . -name "*_test.go" -exec dirname {} \; | sort -u); do \
+			pkg_name=$$(echo $$dir | sed 's|^\./||' | sed 's|/|-|g'); \
+			echo "Testing $$dir..."; \
+			cd $$dir && gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../$(TEST_REPORTS_DIR)/framework-$$pkg_name.xml \
+				-- -v ./... && cd - > /dev/null; \
+			if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+				if which junit-viewer > /dev/null 2>&1; then \
+					echo "$(YELLOW)Generating HTML report for $$pkg_name...$(NC)"; \
+					junit-viewer --results=../$(TEST_REPORTS_DIR)/framework-$$pkg_name.xml --save=../$(TEST_REPORTS_DIR)/framework-$$pkg_name.html 2>/dev/null || true; \
+				fi; \
+			fi; \
+		done || echo "No framework tests found"
+	@echo ""
+	@if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+		echo "$(CYAN)HTML reports saved to $(TEST_REPORTS_DIR)/framework-*.html$(NC)"; \
+	else \
+		echo "$(CYAN)JUnit XML reports saved to $(TEST_REPORTS_DIR)/framework-*.xml$(NC)"; \
+	fi
+
+test-http-transport: install-gotestsum ## Run HTTP transport tests
+	@echo "$(GREEN)Running HTTP transport tests...$(NC)"
+	@mkdir -p $(TEST_REPORTS_DIR)
+	@if [ -f .env ]; then \
+		echo "$(YELLOW)Loading environment variables from .env...$(NC)"; \
+		set -a; . ./.env; set +a; \
+	fi; \
+	cd transports/deepintshield-http && find . -name "*.go" -path "*/tests/*" -o -name "*_test.go" | head -1 > /dev/null && \
+		for dir in $$(find . -name "*_test.go" -exec dirname {} \; | sort -u); do \
+			pkg_name=$$(echo $$dir | sed 's|^\./||' | sed 's|/|-|g'); \
+			echo "Testing $$dir..."; \
+			cd $$dir && gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../../$(TEST_REPORTS_DIR)/http-transport-$$pkg_name.xml \
+				-- -v ./... && cd - > /dev/null; \
+			if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+				if which junit-viewer > /dev/null 2>&1; then \
+					echo "$(YELLOW)Generating HTML report for $$pkg_name...$(NC)"; \
+					junit-viewer --results=../../$(TEST_REPORTS_DIR)/http-transport-$$pkg_name.xml --save=../../$(TEST_REPORTS_DIR)/http-transport-$$pkg_name.html 2>/dev/null || true; \
+				fi; \
+			fi; \
+		done || echo "No HTTP transport tests found"
+	@echo ""
+	@if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+		echo "$(CYAN)HTML reports saved to $(TEST_REPORTS_DIR)/http-transport-*.html$(NC)"; \
+	else \
+		echo "$(CYAN)JUnit XML reports saved to $(TEST_REPORTS_DIR)/http-transport-*.xml$(NC)"; \
+	fi
+
+test-governance: install-gotestsum $(if $(DEBUG),install-delve) ## Run governance tests (Usage: make test-governance TESTCASE=TestName or PATTERN=substring, DEBUG=1 for debugger)
+	@echo "$(GREEN)Running governance tests...$(NC)"
+	@mkdir -p $(TEST_REPORTS_DIR)
+	@if [ -n "$(PATTERN)" ] && [ -n "$(TESTCASE)" ]; then \
+		echo "$(RED)Error: PATTERN and TESTCASE are mutually exclusive$(NC)"; \
+		echo "$(YELLOW)Use PATTERN for substring matching or TESTCASE for exact match$(NC)"; \
+		exit 1; \
+	fi
+	@if [ ! -d "tests/governance" ]; then \
+		echo "$(RED)Error: Governance tests directory not found$(NC)"; \
+		exit 1; \
+	fi
+	@TEST_FAILED=0; \
+	REPORT_FILE=""; \
+	if [ -f .env ]; then \
+		echo "$(YELLOW)Loading environment variables from .env...$(NC)"; \
+		set -a; . ./.env; set +a; \
+	fi; \
+	if [ -n "$(DEBUG)" ]; then \
+		echo "$(CYAN)Debug mode enabled - delve debugger will listen on port 2345$(NC)"; \
+		echo "$(YELLOW)Attach your debugger to localhost:2345$(NC)"; \
+	fi; \
+	if [ -n "$(TESTCASE)" ]; then \
+		echo "$(CYAN)Running test case: $(TESTCASE)$(NC)"; \
+		REPORT_FILE="$(TEST_REPORTS_DIR)/governance-$$(echo $(TESTCASE) | sed 's|/|_|g').xml"; \
+		if [ -n "$(DEBUG)" ]; then \
+			cd tests/governance && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run "^$(TESTCASE)$$" || TEST_FAILED=1; \
+		else \
+			cd tests/governance && GOWORK=off gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../$$REPORT_FILE \
+				-- -v -run "^$(TESTCASE)$$" || TEST_FAILED=1; \
+		fi; \
+		cd ../..; \
+		$(MAKE) cleanup-junit-xml REPORT_FILE=$$REPORT_FILE; \
+		if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+			if which junit-viewer > /dev/null 2>&1; then \
+				echo "$(YELLOW)Generating HTML report...$(NC)"; \
+				junit-viewer --results=$$REPORT_FILE --save=$${REPORT_FILE%.xml}.html 2>/dev/null || true; \
+				echo ""; \
+				echo "$(CYAN)HTML report: $${REPORT_FILE%.xml}.html$(NC)"; \
+				echo "$(CYAN)Open with: open $${REPORT_FILE%.xml}.html$(NC)"; \
+			else \
+				echo ""; \
+				echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+			fi; \
+		else \
+			echo ""; \
+			echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+		fi; \
+	elif [ -n "$(PATTERN)" ]; then \
+		echo "$(CYAN)Running tests matching '$(PATTERN)'...$(NC)"; \
+		REPORT_FILE="$(TEST_REPORTS_DIR)/governance-$(PATTERN).xml"; \
+		if [ -n "$(DEBUG)" ]; then \
+			cd tests/governance && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v -test.run ".*$(PATTERN).*" || TEST_FAILED=1; \
+		else \
+			cd tests/governance && GOWORK=off gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../$$REPORT_FILE \
+				-- -v -run ".*$(PATTERN).*" || TEST_FAILED=1; \
+		fi; \
+		cd ../..; \
+		$(MAKE) cleanup-junit-xml REPORT_FILE=$$REPORT_FILE; \
+		if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+			if which junit-viewer > /dev/null 2>&1; then \
+				echo "$(YELLOW)Generating HTML report...$(NC)"; \
+				junit-viewer --results=$$REPORT_FILE --save=$${REPORT_FILE%.xml}.html 2>/dev/null || true; \
+				echo ""; \
+				echo "$(CYAN)HTML report: $${REPORT_FILE%.xml}.html$(NC)"; \
+				echo "$(CYAN)Open with: open $${REPORT_FILE%.xml}.html$(NC)"; \
+			else \
+				echo ""; \
+				echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+			fi; \
+		else \
+			echo ""; \
+			echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+		fi; \
+	else \
+		echo "$(CYAN)Running all governance tests...$(NC)"; \
+		REPORT_FILE="$(TEST_REPORTS_DIR)/governance-all.xml"; \
+		if [ -n "$(DEBUG)" ]; then \
+			cd tests/governance && GOWORK=off dlv test --headless --listen=:2345 --api-version=2 -- -test.v || TEST_FAILED=1; \
+		else \
+			cd tests/governance && GOWORK=off gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../$$REPORT_FILE \
+				-- -v || TEST_FAILED=1; \
+		fi; \
+		cd ../..; \
+		$(MAKE) cleanup-junit-xml REPORT_FILE=$$REPORT_FILE; \
+		if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+			if which junit-viewer > /dev/null 2>&1; then \
+				echo "$(YELLOW)Generating HTML report...$(NC)"; \
+				junit-viewer --results=$$REPORT_FILE --save=$${REPORT_FILE%.xml}.html 2>/dev/null || true; \
+				echo ""; \
+				echo "$(CYAN)HTML report: $${REPORT_FILE%.xml}.html$(NC)"; \
+				echo "$(CYAN)Open with: open $${REPORT_FILE%.xml}.html$(NC)"; \
+			else \
+				echo ""; \
+				echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+			fi; \
+		else \
+			echo ""; \
+			echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+		fi; \
+	fi; \
+	if [ -f "$$REPORT_FILE" ]; then \
+		ALL_FAILED=$$(grep -B 1 '<failure' "$$REPORT_FILE" 2>/dev/null | \
+			grep '<testcase' | \
+			sed 's/.*name="\([^"]*\)".*/\1/' | \
+			sort -u); \
+		MAX_DEPTH=$$(echo "$$ALL_FAILED" | awk -F'/' '{print NF}' | sort -n | tail -1); \
+		FAILED_TESTS=$$(echo "$$ALL_FAILED" | awk -F'/' -v max="$$MAX_DEPTH" 'NF == max'); \
+		FAILURES=$$(echo "$$FAILED_TESTS" | grep -v '^$$' | wc -l | tr -d ' '); \
+		if [ "$$FAILURES" -gt 0 ]; then \
+			echo ""; \
+			echo "$(RED)═══════════════════════════════════════════════════════════$(NC)"; \
+			echo "$(RED)                    FAILED TEST CASES                      $(NC)"; \
+			echo "$(RED)═══════════════════════════════════════════════════════════$(NC)"; \
+			echo ""; \
+			printf "$(YELLOW)%-60s %-20s$(NC)\n" "Test Name" "Status"; \
+			printf "$(YELLOW)%-60s %-20s$(NC)\n" "─────────────────────────────────────────────────────────────" "────────────────────"; \
+			echo "$$FAILED_TESTS" | while read -r testname; do \
+				if [ -n "$$testname" ]; then \
+					printf "$(RED)%-60s %-20s$(NC)\n" "$$testname" "FAILED"; \
+				fi; \
+			done; \
+			echo ""; \
+			echo "$(RED)Total Failures: $$FAILURES$(NC)"; \
+			echo ""; \
+		else \
+			echo ""; \
+			echo "$(GREEN)═══════════════════════════════════════════════════════════$(NC)"; \
+			echo "$(GREEN)                 ALL TESTS PASSED ✓                       $(NC)"; \
+			echo "$(GREEN)═══════════════════════════════════════════════════════════$(NC)"; \
+			echo ""; \
+		fi; \
+	fi; \
+	if [ $$TEST_FAILED -eq 1 ]; then \
+		exit 1; \
+	fi
+
+setup-mcp-tests: ## Build all MCP test servers in examples/mcps/ (Go and TypeScript)
+	@echo "$(GREEN)Building MCP test servers...$(NC)"
+	@FAILED=0; \
+	for mcp_dir in examples/mcps/*/; do \
+		if [ -d "$$mcp_dir" ]; then \
+			mcp_name=$$(basename $$mcp_dir); \
+			if [ -f "$$mcp_dir/go.mod" ]; then \
+				echo "$(CYAN)Building $$mcp_name (Go)...$(NC)"; \
+				mkdir -p "$$mcp_dir/bin"; \
+				if cd "$$mcp_dir" && GOWORK=off go build -o bin/$$mcp_name . && cd - > /dev/null; then \
+					echo "$(GREEN)  ✓ $$mcp_name$(NC)"; \
+				else \
+					echo "$(RED)  ✗ $$mcp_name failed$(NC)"; \
+					FAILED=1; \
+					cd - > /dev/null 2>&1 || true; \
+				fi; \
+			elif [ -f "$$mcp_dir/package.json" ]; then \
+				echo "$(CYAN)Building $$mcp_name (TypeScript)...$(NC)"; \
+				if cd "$$mcp_dir" && npm install --silent && npm run build && cd - > /dev/null; then \
+					echo "$(GREEN)  ✓ $$mcp_name$(NC)"; \
+				else \
+					echo "$(RED)  ✗ $$mcp_name failed$(NC)"; \
+					FAILED=1; \
+					cd - > /dev/null 2>&1 || true; \
+				fi; \
+			fi; \
+		fi; \
+	done; \
+	if [ $$FAILED -eq 1 ]; then \
+		echo "$(RED)Some MCP test servers failed to build$(NC)"; \
+		exit 1; \
+	fi
+	@echo ""
+	@echo "$(GREEN)✓ All MCP test servers built$(NC)"
+
+test-mcp: install-gotestsum setup-mcp-tests ## Run MCP tests (Usage: make test-mcp [TYPE=connection] [TESTCASE=TestName] [PATTERN=substring])
+	@echo "$(GREEN)Running MCP tests...$(NC)"
+	@mkdir -p $(TEST_REPORTS_DIR)
+	@if [ -n "$(PATTERN)" ] && [ -n "$(TESTCASE)" ]; then \
+		echo "$(RED)Error: PATTERN and TESTCASE are mutually exclusive$(NC)"; \
+		echo "$(YELLOW)Use PATTERN for substring matching or TESTCASE for exact match$(NC)"; \
+		exit 1; \
+	fi
+	@if [ ! -d "core/internal/mcptests" ]; then \
+		echo "$(RED)Error: MCP tests directory not found$(NC)"; \
+		exit 1; \
+	fi
+	@TEST_FAILED=0; \
+	REPORT_FILE=""; \
+	if [ -f .env ]; then \
+		echo "$(YELLOW)Loading environment variables from .env...$(NC)"; \
+		set -a; . ./.env; set +a; \
+	fi; \
+	if [ -n "$(TYPE)" ]; then \
+		TYPE_CLEAN=$$(echo $(TYPE) | sed 's/_test\.go$$//'); \
+		TEST_FILE="core/internal/mcptests/$${TYPE_CLEAN}_test.go"; \
+		if [ ! -f "$$TEST_FILE" ]; then \
+			echo "$(RED)Error: Test file '$$TEST_FILE' not found$(NC)"; \
+			echo "$(YELLOW)Available test types:$(NC)"; \
+			ls -1 core/internal/mcptests/*_test.go 2>/dev/null | sed 's|core/internal/mcptests/||' | sed 's|_test\.go$$||' | sed 's/^/  - /'; \
+			exit 1; \
+		fi; \
+		TEST_PATTERN=$$(grep -h "^func Test" $$TEST_FILE 2>/dev/null | sed 's/func \(Test[^(]*\).*/\1/' | paste -sd '|' - || echo "^Test"); \
+		if [ -n "$(TESTCASE)" ]; then \
+			echo "$(CYAN)Running $(TYPE) test: $(TESTCASE)...$(NC)"; \
+			SAFE_TESTCASE=$$(echo "$(TESTCASE)" | sed 's|/|_|g'); \
+			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-$(TYPE)-$$SAFE_TESTCASE.xml"; \
+			cd core/internal/mcptests && GOWORK=off gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../../$$REPORT_FILE \
+				-- -v -race -run "^$(TESTCASE)$$" . || TEST_FAILED=1; \
+		elif [ -n "$(PATTERN)" ]; then \
+			echo "$(CYAN)Running $(TYPE) tests matching '$(PATTERN)'...$(NC)"; \
+			SAFE_PATTERN=$$(echo "$(PATTERN)" | sed 's|/|_|g'); \
+			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-$(TYPE)-$$SAFE_PATTERN.xml"; \
+			cd core/internal/mcptests && GOWORK=off gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../../$$REPORT_FILE \
+				-- -v -race -run ".*$(PATTERN).*" . || TEST_FAILED=1; \
+		else \
+			echo "$(CYAN)Running all $(TYPE) tests (pattern: $$TEST_PATTERN)...$(NC)"; \
+			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-$(TYPE).xml"; \
+			cd core/internal/mcptests && GOWORK=off gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../../$$REPORT_FILE \
+				-- -v -race -run "$$TEST_PATTERN" . || TEST_FAILED=1; \
+		fi; \
+		cd ../../..; \
+		if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+			if which junit-viewer > /dev/null 2>&1; then \
+				echo "$(YELLOW)Generating HTML report...$(NC)"; \
+				junit-viewer --results=$$REPORT_FILE --save=$${REPORT_FILE%.xml}.html 2>/dev/null || true; \
+				echo ""; \
+				echo "$(CYAN)HTML report: $${REPORT_FILE%.xml}.html$(NC)"; \
+				echo "$(CYAN)Open with: open $${REPORT_FILE%.xml}.html$(NC)"; \
+			else \
+				echo ""; \
+				echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+			fi; \
+		else \
+			echo ""; \
+			echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+		fi; \
+	else \
+		if [ -n "$(TESTCASE)" ]; then \
+			echo "$(CYAN)Running test case: $(TESTCASE) across all MCP tests...$(NC)"; \
+			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-all-$(TESTCASE).xml"; \
+			cd core/internal/mcptests && GOWORK=off gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../../$$REPORT_FILE \
+				-- -v -race -run "^$(TESTCASE)$$" || TEST_FAILED=1; \
+		elif [ -n "$(PATTERN)" ]; then \
+			echo "$(CYAN)Running tests matching '$(PATTERN)' across all MCP tests...$(NC)"; \
+			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-all-$(PATTERN).xml"; \
+			cd core/internal/mcptests && GOWORK=off gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../../$$REPORT_FILE \
+				-- -v -race -run ".*$(PATTERN).*" || TEST_FAILED=1; \
+		else \
+			echo "$(CYAN)Running all MCP tests...$(NC)"; \
+			REPORT_FILE="$(TEST_REPORTS_DIR)/mcp-all.xml"; \
+			cd core/internal/mcptests && GOWORK=off gotestsum \
+				--format=$(GOTESTSUM_FORMAT) \
+				--junitfile=../../../$$REPORT_FILE \
+				-- -v -race || TEST_FAILED=1; \
+		fi; \
+		cd ../../..; \
+		if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+			if which junit-viewer > /dev/null 2>&1; then \
+				echo "$(YELLOW)Generating HTML report...$(NC)"; \
+				junit-viewer --results=$$REPORT_FILE --save=$${REPORT_FILE%.xml}.html 2>/dev/null || true; \
+				echo ""; \
+				echo "$(CYAN)HTML report: $${REPORT_FILE%.xml}.html$(NC)"; \
+				echo "$(CYAN)Open with: open $${REPORT_FILE%.xml}.html$(NC)"; \
+			else \
+				echo ""; \
+				echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+			fi; \
+		else \
+			echo ""; \
+			echo "$(CYAN)JUnit XML report: $$REPORT_FILE$(NC)"; \
+		fi; \
+	fi; \
+	if [ $$TEST_FAILED -eq 1 ]; then \
+		exit 1; \
+	fi
+
+test-all: test-core test-framework test-plugins test-http-transport test test-cli ## Run all tests
+	@echo ""
+	@echo "$(GREEN)═══════════════════════════════════════════════════════════$(NC)"
+	@echo "$(GREEN)              All Tests Complete - Summary                 $(NC)"
+	@echo "$(GREEN)═══════════════════════════════════════════════════════════$(NC)"
+	@echo ""
+	@if [ -z "$$CI" ] && [ -z "$$GITHUB_ACTIONS" ] && [ -z "$$GITLAB_CI" ] && [ -z "$$CIRCLECI" ] && [ -z "$$JENKINS_HOME" ]; then \
+		echo "$(YELLOW)Generating combined HTML report...$(NC)"; \
+		junit-viewer --results=$(TEST_REPORTS_DIR) --save=$(TEST_REPORTS_DIR)/index.html 2>/dev/null || true; \
+		echo ""; \
+		echo "$(CYAN)HTML reports available in $(TEST_REPORTS_DIR)/:$(NC)"; \
+		ls -1 $(TEST_REPORTS_DIR)/*.html 2>/dev/null | sed 's/^/  ✓ /' || echo "  No reports found"; \
+		echo ""; \
+		echo "$(YELLOW)📊 View all test results:$(NC)"; \
+		echo "$(CYAN)  open $(TEST_REPORTS_DIR)/index.html$(NC)"; \
+		echo ""; \
+		echo "$(YELLOW)Or view individual reports:$(NC)"; \
+		ls -1 $(TEST_REPORTS_DIR)/*.html 2>/dev/null | grep -v index.html | sed 's|$(TEST_REPORTS_DIR)/|  open $(TEST_REPORTS_DIR)/|' || true; \
+		echo ""; \
+	else \
+		echo "$(CYAN)JUnit XML reports available in $(TEST_REPORTS_DIR)/:$(NC)"; \
+		ls -1 $(TEST_REPORTS_DIR)/*.xml 2>/dev/null | sed 's/^/  ✓ /' || echo "  No reports found"; \
+		echo ""; \
+	fi
+
+test-chatbot: ## Run interactive chatbot integration test (Usage: RUN_CHATBOT_TEST=1 make test-chatbot)
+	@echo "$(GREEN)Running interactive chatbot integration test...$(NC)"
+	@if [ -z "$(RUN_CHATBOT_TEST)" ]; then \
+		echo "$(YELLOW)⚠️  This is an interactive test. Set RUN_CHATBOT_TEST=1 to run it.$(NC)"; \
+		echo "$(CYAN)Usage: RUN_CHATBOT_TEST=1 make test-chatbot$(NC)"; \
+		echo ""; \
+		echo "$(YELLOW)Required environment variables:$(NC)"; \
+		echo "  - OPENAI_API_KEY (required)"; \
+		echo "  - ANTHROPIC_API_KEY (optional)"; \
+		echo "  - Additional provider keys as needed"; \
+		exit 0; \
+	fi
+	@if [ -f .env ]; then \
+		echo "$(YELLOW)Loading environment variables from .env...$(NC)"; \
+		set -a; . ./.env; set +a; \
+	fi
+	@cd core && RUN_CHATBOT_TEST=1 go test -v -run TestChatbot
+
+test-integrations-py: ## Run Python integration tests (Usage: make test-integrations-py [INTEGRATION=openai] [TESTCASE=test_name] [PATTERN=substring] [VERBOSE=1])
+	@echo "$(GREEN)Running Python integration tests...$(NC)"
+	@if [ ! -d "tests/integrations/python" ]; then \
+		echo "$(RED)Error: tests/integrations/python directory not found$(NC)"; \
+		exit 1; \
+	fi; \
+	if [ -n "$(PATTERN)" ] && [ -n "$(TESTCASE)" ]; then \
+		echo "$(RED)Error: PATTERN and TESTCASE are mutually exclusive$(NC)"; \
+		echo "$(YELLOW)Use PATTERN for substring matching or TESTCASE for exact match$(NC)"; \
+		exit 1; \
+	fi; \
+	if [ -n "$(TESTCASE)" ] && [ -z "$(INTEGRATION)" ]; then \
+		echo "$(RED)Error: TESTCASE requires INTEGRATION to be specified$(NC)"; \
+		echo "$(YELLOW)Usage: make test-integrations-py INTEGRATION=anthropic TESTCASE=test_05_end2end_tool_calling$(NC)"; \
+		exit 1; \
+	fi; \
+	if [ -f .env ]; then \
+		echo "$(YELLOW)Loading environment variables from .env...$(NC)"; \
+		set -a; . ./.env; set +a; \
+	fi; \
+	DEEPINTSHIELD_STARTED=0; \
+	DEEPINTSHIELD_PID=""; \
+	TAIL_PID=""; \
+	TEST_PORT=$${PORT:-8080}; \
+	TEST_HOST=$${HOST:-localhost}; \
+	echo "$(CYAN)Checking if DeepIntShield is running on $$TEST_HOST:$$TEST_PORT...$(NC)"; \
+	if curl -s -o /dev/null -w "%{http_code}" http://$$TEST_HOST:$$TEST_PORT/health 2>/dev/null | grep -q "200\|404"; then \
+		echo "$(GREEN)✓ DeepIntShield is already running$(NC)"; \
+	else \
+		echo "$(YELLOW)DeepIntShield not running, starting it...$(NC)"; \
+		./tmp/deepintshield-http -host "$$TEST_HOST" -port "$$TEST_PORT" -log-style "$(LOG_STYLE)" -log-level "$(LOG_LEVEL)" -app-dir tests/integrations/python > /tmp/deepintshield-test.log 2>&1 & \
+		DEEPINTSHIELD_PID=$$!; \
+		DEEPINTSHIELD_STARTED=1; \
+		echo "$(YELLOW)Waiting for DeepIntShield to be ready...$(NC)"; \
+		echo "$(CYAN)DeepIntShield logs: /tmp/deepintshield-test.log$(NC)"; \
+		(tail -f /tmp/deepintshield-test.log 2>/dev/null | grep -E "error|panic|Error|ERRO|fatal|Fatal|FATAL" --line-buffered &) & \
+		TAIL_PID=$$!; \
+		for i in 1 2 3 4 5 6 7 8 9 10; do \
+			if curl -s -o /dev/null http://$$TEST_HOST:$$TEST_PORT/health 2>/dev/null; then \
+				echo "$(GREEN)✓ DeepIntShield is ready (PID: $$DEEPINTSHIELD_PID)$(NC)"; \
+				break; \
+			fi; \
+			if [ $$i -eq 10 ]; then \
+				echo "$(RED)Failed to start DeepIntShield$(NC)"; \
+				echo "$(YELLOW)DeepIntShield logs:$(NC)"; \
+				cat /tmp/deepintshield-test.log 2>/dev/null || echo "No log file found"; \
+				[ -n "$$DEEPINTSHIELD_PID" ] && kill $$DEEPINTSHIELD_PID 2>/dev/null; \
+				[ -n "$$TAIL_PID" ] && kill $$TAIL_PID 2>/dev/null; \
+				exit 1; \
+			fi; \
+			sleep 1; \
+		done; \
+	fi; \
+	TEST_FAILED=0; \
+	if ! which uv > /dev/null 2>&1; then \
+		echo "$(YELLOW)uv not found, checking for pytest...$(NC)"; \
+		if ! which pytest > /dev/null 2>&1; then \
+			echo "$(RED)Error: Neither uv nor pytest found$(NC)"; \
+			echo "$(YELLOW)Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh$(NC)"; \
+			echo "$(YELLOW)Or install pytest: pip install pytest$(NC)"; \
+			[ $$DEEPINTSHIELD_STARTED -eq 1 ] && [ -n "$$DEEPINTSHIELD_PID" ] && kill $$DEEPINTSHIELD_PID 2>/dev/null; \
+			[ -n "$$TAIL_PID" ] && kill $$TAIL_PID 2>/dev/null; \
+			exit 1; \
+		fi; \
+		echo "$(CYAN)Using pytest directly$(NC)"; \
+		if [ -n "$(INTEGRATION)" ]; then \
+			if [ -n "$(TESTCASE)" ]; then \
+				echo "$(CYAN)Running $(INTEGRATION) integration test: $(TESTCASE)...$(NC)"; \
+				cd tests/integrations/python && pytest tests/test_$(INTEGRATION).py::$(TESTCASE) $(if $(VERBOSE),-v,-q) || TEST_FAILED=1; \
+			elif [ -n "$(PATTERN)" ]; then \
+				echo "$(CYAN)Running $(INTEGRATION) integration tests matching '$(PATTERN)'...$(NC)"; \
+				cd tests/integrations/python && pytest tests/test_$(INTEGRATION).py -k "$(PATTERN)" $(if $(VERBOSE),-v,-q) || TEST_FAILED=1; \
+			else \
+				echo "$(CYAN)Running $(INTEGRATION) integration tests...$(NC)"; \
+				cd tests/integrations/python && pytest tests/test_$(INTEGRATION).py $(if $(VERBOSE),-v,-q) || TEST_FAILED=1; \
+			fi; \
+		else \
+			if [ -n "$(PATTERN)" ]; then \
+				echo "$(CYAN)Running all integration tests matching '$(PATTERN)'...$(NC)"; \
+				cd tests/integrations/python && pytest -k "$(PATTERN)" $(if $(VERBOSE),-v,-q) || TEST_FAILED=1; \
+			else \
+				echo "$(CYAN)Running all integration tests...$(NC)"; \
+				cd tests/integrations/python && pytest $(if $(VERBOSE),-v,-q) || TEST_FAILED=1; \
+			fi; \
+		fi; \
+	else \
+		echo "$(CYAN)Using uv (fast mode)$(NC)"; \
+		cd tests/integrations/python && \
+		if [ -n "$(INTEGRATION)" ]; then \
+			if [ -n "$(TESTCASE)" ]; then \
+				echo "$(CYAN)Running $(INTEGRATION) integration test: $(TESTCASE)...$(NC)"; \
+				uv run pytest tests/test_$(INTEGRATION).py::$(TESTCASE) $(if $(VERBOSE),-v,-q) || TEST_FAILED=1; \
+			elif [ -n "$(PATTERN)" ]; then \
+				echo "$(CYAN)Running $(INTEGRATION) integration tests matching '$(PATTERN)'...$(NC)"; \
+				uv run pytest tests/test_$(INTEGRATION).py -k "$(PATTERN)" $(if $(VERBOSE),-v,-q) || TEST_FAILED=1; \
+			else \
+				echo "$(CYAN)Running $(INTEGRATION) integration tests...$(NC)"; \
+				uv run pytest tests/test_$(INTEGRATION).py $(if $(VERBOSE),-v,-q) || TEST_FAILED=1; \
+			fi; \
+		else \
+			if [ -n "$(PATTERN)" ]; then \
+				echo "$(CYAN)Running all integration tests matching '$(PATTERN)'...$(NC)"; \
+				uv run pytest -k "$(PATTERN)" $(if $(VERBOSE),-v,-q) || TEST_FAILED=1; \
+			else \
+				echo "$(CYAN)Running all integration tests...$(NC)"; \
+				uv run pytest $(if $(VERBOSE),-v,-q) || TEST_FAILED=1; \
+			fi; \
+		fi; \
+	fi; \
+	if [ $$DEEPINTSHIELD_STARTED -eq 1 ] && [ -n "$$DEEPINTSHIELD_PID" ]; then \
+		echo "$(YELLOW)Stopping DeepIntShield (PID: $$DEEPINTSHIELD_PID)...$(NC)"; \
+		kill $$DEEPINTSHIELD_PID 2>/dev/null || true; \
+		[ -n "$$TAIL_PID" ] && kill $$TAIL_PID 2>/dev/null || true; \
+		wait $$DEEPINTSHIELD_PID 2>/dev/null || true; \
+		echo "$(GREEN)✓ DeepIntShield stopped$(NC)"; \
+		if [ $$TEST_FAILED -eq 1 ]; then \
+			echo ""; \
+			echo "$(YELLOW)Last 50 lines of DeepIntShield logs:$(NC)"; \
+			tail -50 /tmp/deepintshield-test.log 2>/dev/null || echo "No log file found"; \
+		fi; \
+	fi; \
+	echo ""; \
+	if [ $$TEST_FAILED -eq 1 ]; then \
+		echo "$(RED)✗ Integration tests failed$(NC)"; \
+		echo "$(CYAN)Full DeepIntShield logs: /tmp/deepintshield-test.log$(NC)"; \
+		exit 1; \
+	else \
+		echo "$(GREEN)✓ Integration tests complete$(NC)"; \
+	fi
+
+test-integrations-ts: ## Run TypeScript integration tests (Usage: make test-integrations-ts [INTEGRATION=openai] [TESTCASE=test_name] [PATTERN=substring] [VERBOSE=1])
+	@echo "$(GREEN)Running TypeScript integration tests...$(NC)"
+	@if [ ! -d "tests/integrations/typescript" ]; then \
+		echo "$(RED)Error: tests/integrations/typescript directory not found$(NC)"; \
+		exit 1; \
+	fi; \
+	if [ -n "$(PATTERN)" ] && [ -n "$(TESTCASE)" ]; then \
+		echo "$(RED)Error: PATTERN and TESTCASE are mutually exclusive$(NC)"; \
+		echo "$(YELLOW)Use PATTERN for substring matching or TESTCASE for exact match$(NC)"; \
+		exit 1; \
+	fi; \
+	if [ -n "$(TESTCASE)" ] && [ -z "$(INTEGRATION)" ]; then \
+		echo "$(RED)Error: TESTCASE requires INTEGRATION to be specified$(NC)"; \
+		echo "$(YELLOW)Usage: make test-integrations-ts INTEGRATION=openai TESTCASE=test_simple_chat$(NC)"; \
+		exit 1; \
+	fi; \
+	if [ -f .env ]; then \
+		echo "$(YELLOW)Loading environment variables from .env...$(NC)"; \
+		set -a; . ./.env; set +a; \
+	fi; \
+	DEEPINTSHIELD_STARTED=0; \
+	DEEPINTSHIELD_PID=""; \
+	TAIL_PID=""; \
+	TEST_PORT=$${PORT:-8080}; \
+	TEST_HOST=$${HOST:-localhost}; \
+	echo "$(CYAN)Checking if DeepIntShield is running on $$TEST_HOST:$$TEST_PORT...$(NC)"; \
+	if curl -s -o /dev/null -w "%{http_code}" http://$$TEST_HOST:$$TEST_PORT/health 2>/dev/null | grep -q "200\|404"; then \
+		echo "$(GREEN)✓ DeepIntShield is already running$(NC)"; \
+	else \
+		echo "$(YELLOW)DeepIntShield not running, starting it...$(NC)"; \
+		./tmp/deepintshield-http -host "$$TEST_HOST" -port "$$TEST_PORT" -log-style "$(LOG_STYLE)" -log-level "$(LOG_LEVEL)" -app-dir tests/integrations/typescript > /tmp/deepintshield-test.log 2>&1 & \
+		DEEPINTSHIELD_PID=$$!; \
+		DEEPINTSHIELD_STARTED=1; \
+		echo "$(YELLOW)Waiting for DeepIntShield to be ready...$(NC)"; \
+		echo "$(CYAN)DeepIntShield logs: /tmp/deepintshield-test.log$(NC)"; \
+		(tail -f /tmp/deepintshield-test.log 2>/dev/null | grep -E "error|panic|Error|ERRO|fatal|Fatal|FATAL" --line-buffered &) & \
+		TAIL_PID=$$!; \
+		for i in 1 2 3 4 5 6 7 8 9 10; do \
+			if curl -s -o /dev/null http://$$TEST_HOST:$$TEST_PORT/health 2>/dev/null; then \
+				echo "$(GREEN)✓ DeepIntShield is ready (PID: $$DEEPINTSHIELD_PID)$(NC)"; \
+				break; \
+			fi; \
+			if [ $$i -eq 10 ]; then \
+				echo "$(RED)Failed to start DeepIntShield$(NC)"; \
+				echo "$(YELLOW)DeepIntShield logs:$(NC)"; \
+				cat /tmp/deepintshield-test.log 2>/dev/null || echo "No log file found"; \
+				[ -n "$$DEEPINTSHIELD_PID" ] && kill $$DEEPINTSHIELD_PID 2>/dev/null; \
+				[ -n "$$TAIL_PID" ] && kill $$TAIL_PID 2>/dev/null; \
+				exit 1; \
+			fi; \
+			sleep 1; \
+		done; \
+	fi; \
+	TEST_FAILED=0; \
+	if ! which npm > /dev/null 2>&1; then \
+		echo "$(RED)Error: npm not found$(NC)"; \
+		echo "$(YELLOW)Install Node.js: https://nodejs.org/$(NC)"; \
+		[ $$DEEPINTSHIELD_STARTED -eq 1 ] && [ -n "$$DEEPINTSHIELD_PID" ] && kill $$DEEPINTSHIELD_PID 2>/dev/null; \
+		[ -n "$$TAIL_PID" ] && kill $$TAIL_PID 2>/dev/null; \
+		exit 1; \
+	fi; \
+	echo "$(CYAN)Using npm$(NC)"; \
+	cd tests/integrations/typescript && \
+	if [ ! -d "node_modules" ]; then \
+		echo "$(YELLOW)Installing dependencies...$(NC)"; \
+		npm install; \
+	fi; \
+	if [ -n "$(INTEGRATION)" ]; then \
+		if [ -n "$(TESTCASE)" ]; then \
+			echo "$(CYAN)Running $(INTEGRATION) integration test: $(TESTCASE)...$(NC)"; \
+			npm test -- tests/test-$(INTEGRATION).test.ts -t "$(TESTCASE)" $(if $(VERBOSE),--reporter=verbose,) || TEST_FAILED=1; \
+		elif [ -n "$(PATTERN)" ]; then \
+			echo "$(CYAN)Running $(INTEGRATION) integration tests matching '$(PATTERN)'...$(NC)"; \
+			npm test -- tests/test-$(INTEGRATION).test.ts -t "$(PATTERN)" $(if $(VERBOSE),--reporter=verbose,) || TEST_FAILED=1; \
+		else \
+			echo "$(CYAN)Running $(INTEGRATION) integration tests...$(NC)"; \
+			npm test -- tests/test-$(INTEGRATION).test.ts $(if $(VERBOSE),--reporter=verbose,) || TEST_FAILED=1; \
+		fi; \
+	else \
+		if [ -n "$(PATTERN)" ]; then \
+			echo "$(CYAN)Running all integration tests matching '$(PATTERN)'...$(NC)"; \
+			npm test -- -t "$(PATTERN)" $(if $(VERBOSE),--reporter=verbose,) || TEST_FAILED=1; \
+		else \
+			echo "$(CYAN)Running all integration tests...$(NC)"; \
+			npm test $(if $(VERBOSE),-- --reporter=verbose,) || TEST_FAILED=1; \
+		fi; \
+	fi; \
+	if [ $$DEEPINTSHIELD_STARTED -eq 1 ] && [ -n "$$DEEPINTSHIELD_PID" ]; then \
+		echo "$(YELLOW)Stopping DeepIntShield (PID: $$DEEPINTSHIELD_PID)...$(NC)"; \
+		kill $$DEEPINTSHIELD_PID 2>/dev/null || true; \
+		[ -n "$$TAIL_PID" ] && kill $$TAIL_PID 2>/dev/null || true; \
+		wait $$DEEPINTSHIELD_PID 2>/dev/null || true; \
+		echo "$(GREEN)✓ DeepIntShield stopped$(NC)"; \
+		if [ $$TEST_FAILED -eq 1 ]; then \
+			echo ""; \
+			echo "$(YELLOW)Last 50 lines of DeepIntShield logs:$(NC)"; \
+			tail -50 /tmp/deepintshield-test.log 2>/dev/null || echo "No log file found"; \
+		fi; \
+	fi; \
+	echo ""; \
+	if [ $$TEST_FAILED -eq 1 ]; then \
+		echo "$(RED)✗ TypeScript integration tests failed$(NC)"; \
+		echo "$(CYAN)Full DeepIntShield logs: /tmp/deepintshield-test.log$(NC)"; \
+		exit 1; \
+	else \
+		echo "$(GREEN)✓ TypeScript integration tests complete$(NC)"; \
+	fi
+
+install-playwright: ## Install Playwright test dependencies
+	@echo "$(GREEN)Installing Playwright dependencies...$(NC)"
+	@which node > /dev/null || (echo "$(RED)Error: Node.js is not installed. Please install Node.js first.$(NC)" && exit 1)
+	@which npm > /dev/null || (echo "$(RED)Error: npm is not installed. Please install npm first.$(NC)" && exit 1)
+	@cd tests/e2e && npm install
+	@cd tests/e2e && if npx playwright install --list 2>/dev/null | grep -q "chromium"; then \
+		echo "$(CYAN)Chromium is already installed, skipping download$(NC)"; \
+	else \
+		echo "$(CYAN)Installing Chromium...$(NC)"; \
+		npx playwright install --with-deps chromium; \
+	fi
+	@echo "$(GREEN)Playwright is ready$(NC)"
+
+build-test-plugin: ## Build test plugin for E2E tests (copies to tmp/deepintshield-test-plugin.so)
+	@echo "$(GREEN)Building test plugin for E2E tests...$(NC)"
+	@cd examples/plugins/hello-world && make dev
+	@mkdir -p tmp
+	@cp examples/plugins/hello-world/build/hello-world.so tmp/deepintshield-test-plugin.so
+	@echo "$(GREEN)✓ Test plugin ready at tmp/deepintshield-test-plugin.so$(NC)"
+
+run-e2e: install-playwright ## Run E2E tests (Usage: make run-e2e [FLOW=providers|virtual-keys|config])
+	@echo "$(GREEN)Running Playwright E2E tests...$(NC)"
+	@if [ -n "$(FLOW)" ]; then \
+		echo "$(CYAN)Running $(FLOW) tests...$(NC)"; \
+		if [ "$(FLOW)" = "config" ]; then \
+			cd tests/e2e && npx playwright test --project=chromium-config; \
+		else \
+			cd tests/e2e && npx playwright test features/$(FLOW); \
+		fi; \
+	else \
+		echo "$(CYAN)Running all E2E tests...$(NC)"; \
+		cd tests/e2e && npx playwright test; \
+	fi
+	@echo ""
+	@echo "$(GREEN)E2E tests complete$(NC)"
+	@echo "$(CYAN)View HTML report: cd tests/e2e && npx playwright show-report$(NC)"
+
+run-e2e-ui: install-playwright ## Run E2E tests in interactive UI mode
+	@if [ -f .env ]; then \
+		echo "$(YELLOW)Loading environment variables from .env...$(NC)"; \
+		set -a; . ./.env; set +a; \
+	fi; \
+	echo "$(GREEN)Opening Playwright UI...$(NC)"; \
+	cd tests/e2e && npx playwright test --ui
+
+run-e2e-headed: install-playwright ## Run E2E tests in headed browser mode
+	@echo "$(GREEN)Running E2E tests in headed mode...$(NC)"
+	@if [ -n "$(FLOW)" ]; then \
+		echo "$(CYAN)Running $(FLOW) tests (headed)...$(NC)"; \
+		if [ "$(FLOW)" = "config" ]; then \
+			cd tests/e2e && npx playwright test --project=chromium-config --headed; \
+		else \
+			cd tests/e2e && npx playwright test features/$(FLOW) --headed; \
+		fi; \
+	else \
+		echo "$(CYAN)Running all E2E tests (headed)...$(NC)"; \
+		cd tests/e2e && npx playwright test --headed; \
+	fi
+
+# Quick start with example config
+quick-start: ## Quick start with example config
+	@echo "$(GREEN)Quick starting DeepIntShield with example configuration...$(NC)"
+	@$(MAKE) dev
+
+# Linting and formatting
+lint: ## Run linter for Go code
+	@echo "$(GREEN)Running golangci-lint...$(NC)"
+	@golangci-lint run ./...
+
+fmt: ## Format Go code
+	@echo "$(GREEN)Formatting Go code...$(NC)"
+	@gofmt -s -w .
+	@goimports -w .
+
+# Workspace helpers
+setup-workspace: ## Set up Go workspace with all local modules for development
+	@echo "$(GREEN)Setting up Go workspace for local development...$(NC)"
+	@echo "$(YELLOW)Cleaning existing workspace...$(NC)"
+	@rm -f go.work go.work.sum || true
+	@echo "$(YELLOW)Initializing new workspace...$(NC)"
+	@go work init ./cli ./core ./framework ./transports
+	@echo "$(YELLOW)Adding plugin modules...$(NC)"
+	@for plugin_dir in ./plugins/*/; do \
+		if [ -d "$$plugin_dir" ] && [ -f "$$plugin_dir/go.mod" ]; then \
+			echo "  Adding plugin: $$(basename $$plugin_dir)"; \
+			go work use "$$plugin_dir"; \
+		fi; \
+	done
+	@echo "$(YELLOW)Syncing workspace...$(NC)"
+	@go work sync
+	@echo "$(GREEN)✓ Go workspace ready with all local modules$(NC)"
+	@echo ""
+	@echo "$(CYAN)Local modules in workspace:$(NC)"
+	@go list -m all | grep "github.com/deepint-shield/ai-security" | grep -v " v" | sed 's/^/  ✓ /'
+	@echo ""
+	@echo "$(CYAN)Remote modules (no local version):$(NC)"
+	@go list -m all | grep "github.com/deepint-shield/ai-security" | grep " v" | sed 's/^/  → /'
+	@echo ""
+	@echo "$(YELLOW)Note: go.work files are not committed to version control$(NC)"
+
+work-init: ## Create local go.work to use local modules for development (legacy)
+	@echo "$(YELLOW)⚠️  work-init is deprecated, use 'make setup-workspace' instead$(NC)"
+	@$(MAKE) setup-workspace
+
+work-clean: ## Remove local go.work
+	@rm -f go.work go.work.sum || true
+	@echo "$(GREEN)Removed local go.work files$(NC)"
+
+# Module parameter for mod-tidy (all/core/plugins/framework/transport)
+MODULE ?= all
+
+mod-tidy: ## Run go mod tidy on modules (Usage: make mod-tidy [MODULE=all|cli|core|plugins|framework|transport])
+	@echo "$(GREEN)Running go mod tidy...$(NC)"
+	@if [ "$(MODULE)" = "all" ] || [ "$(MODULE)" = "cli" ]; then \
+		echo "$(CYAN)Tidying cli...$(NC)"; \
+		cd cli && $(if $(LOCAL),,GOWORK=off) go mod tidy && echo "$(GREEN)  ✓ cli$(NC)"; \
+	fi
+	@if [ "$(MODULE)" = "all" ] || [ "$(MODULE)" = "core" ]; then \
+		echo "$(CYAN)Tidying core...$(NC)"; \
+		cd core && go mod tidy && echo "$(GREEN)  ✓ core$(NC)"; \
+	fi
+	@if [ "$(MODULE)" = "all" ] || [ "$(MODULE)" = "framework" ]; then \
+		echo "$(CYAN)Tidying framework...$(NC)"; \
+		cd framework && go mod tidy && echo "$(GREEN)  ✓ framework$(NC)"; \
+	fi
+	@if [ "$(MODULE)" = "all" ] || [ "$(MODULE)" = "transport" ]; then \
+		echo "$(CYAN)Tidying transports...$(NC)"; \
+		cd transports && go mod tidy && echo "$(GREEN)  ✓ transports$(NC)"; \
+	fi
+	@if [ "$(MODULE)" = "all" ] || [ "$(MODULE)" = "plugins" ]; then \
+		echo "$(CYAN)Tidying plugins...$(NC)"; \
+		for plugin_dir in ./plugins/*/; do \
+			if [ -d "$$plugin_dir" ] && [ -f "$$plugin_dir/go.mod" ]; then \
+				plugin_name=$$(basename $$plugin_dir); \
+				cd $$plugin_dir && go mod tidy && cd ../.. && echo "$(GREEN)  ✓ plugins/$$plugin_name$(NC)"; \
+			fi; \
+		done; \
+	fi
+	@echo ""
+	@echo "$(GREEN)✓ go mod tidy complete$(NC)"
+
+test-cli: install-gotestsum ## Run CLI tests
+	@echo "$(GREEN)Running CLI tests...$(NC)"
+	@mkdir -p $(TEST_REPORTS_DIR)
+	@cd cli && GOWORK=off gotestsum \
+		--format=$(GOTESTSUM_FORMAT) \
+		--junitfile=../$(TEST_REPORTS_DIR)/cli.xml \
+		-- ./...

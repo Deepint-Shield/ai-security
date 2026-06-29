@@ -1,0 +1,17 @@
+{
+  "$schema": "https://deepintshield.com/schema",
+  "config_store": {
+    "enabled": true,
+    "type": "sqlite",
+    "config": {
+      "path": "../../tests/configs/withconfigstorelogsstore/config.db"
+    }
+  },
+  "logs_store": {
+    "enabled": true,
+    "type": "sqlite",
+    "config": {
+      "path": "../../tests/configs/withconfigstorelogsstore/logs.db"
+    }
+  }
+}

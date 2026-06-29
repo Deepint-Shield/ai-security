@@ -1,0 +1,14 @@
+# Prometheus configuration for tracking deepintshield-http service (for development and testing purposes only, don't use in production without proper setup)
+global:
+  scrape_interval: 5s # Scrape every 5 seconds
+
+# Note: Target configuration depends on your deployment environment:
+# - For local development: Use "host.docker.internal:8080" to access the service running on your host machine
+# - For Docker deployment: Use "deepintshield-api:8080" to access the service within the Docker network
+#   Make sure to replace "deepintshield-api" and "8080" with your actual docker container name and port if different
+#   Also check that you have the deepintshield container inside "deepintshield_tracking_network".
+
+scrape_configs:
+  - job_name: "deepintshield-api"
+    static_configs:
+      - targets: ["host.docker.internal:8080"] # Scrape from the /metrics endpoint

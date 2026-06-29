@@ -1,0 +1,9 @@
+# LOCAL-ONLY workaround (not committed): the repo lives under ~/Documents,
+# which the colima vz VM cannot bind-mount (macOS TCC). Re-point only the
+# server's config.json mount at a $HOME-root path the VM CAN read.
+# Revert: delete this file. Re-sync after editing config.json:
+#   cp config.json ~/.deepintshield/config.json
+services:
+  deepintshield-server:
+    volumes:
+      - ${HOME}/.deepintshield/config.json:/config/config.json:ro

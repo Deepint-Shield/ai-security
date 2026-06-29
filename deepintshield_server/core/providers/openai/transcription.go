@@ -1,0 +1,117 @@
+package openai
+
+import (
+	"fmt"
+	"mime/multipart"
+
+	"github.com/deepint-shield/ai-security/core/providers/utils"
+	"github.com/deepint-shield/ai-security/core/schemas"
+)
+
+// ToDeepIntShieldTranscriptionRequest converts an OpenAI transcription request to DeepIntShield format
+func (request *OpenAITranscriptionRequest) ToDeepIntShieldTranscriptionRequest(ctx *schemas.DeepIntShieldContext) *schemas.DeepIntShieldTranscriptionRequest {
+	provider, model := schemas.ParseModelString(request.Model, utils.CheckAndSetDefaultProvider(ctx, schemas.OpenAI))
+
+	return &schemas.DeepIntShieldTranscriptionRequest{
+		Provider: provider,
+		Model:    model,
+		Input: &schemas.TranscriptionInput{
+			File: request.File,
+		},
+		Params:    &request.TranscriptionParameters,
+		Fallbacks: schemas.ParseFallbacks(request.Fallbacks),
+	}
+}
+
+// ToOpenAITranscriptionRequest converts a DeepIntShield transcription request to OpenAI format
+func ToOpenAITranscriptionRequest(deepintshieldReq *schemas.DeepIntShieldTranscriptionRequest) *OpenAITranscriptionRequest {
+	if deepintshieldReq == nil || deepintshieldReq.Input.File == nil {
+		return nil
+	}
+
+	transcriptionInput := deepintshieldReq.Input
+	params := deepintshieldReq.Params
+
+	openaiReq := &OpenAITranscriptionRequest{
+		Model:    deepintshieldReq.Model,
+		File:     transcriptionInput.File,
+		Filename: transcriptionInput.Filename,
+	}
+
+	if params != nil {
+		openaiReq.TranscriptionParameters = *params
+	}
+
+	return openaiReq
+}
+
+// ParseTranscriptionFormDataBodyFromRequest parses the transcription request and writes it to the multipart form.
+func ParseTranscriptionFormDataBodyFromRequest(writer *multipart.Writer, openaiReq *OpenAITranscriptionRequest, providerName schemas.ModelProvider) *schemas.DeepIntShieldError {
+	// Add file field
+	filename := openaiReq.Filename
+	if filename == "" {
+		filename = utils.AudioFilenameFromBytes(openaiReq.File)
+	}
+	fileWriter, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return utils.NewDeepIntShieldOperationError("failed to create form file", err, providerName)
+	}
+	if _, err := fileWriter.Write(openaiReq.File); err != nil {
+		return utils.NewDeepIntShieldOperationError("failed to write file data", err, providerName)
+	}
+
+	// Add model field
+	if err := writer.WriteField("model", openaiReq.Model); err != nil {
+		return utils.NewDeepIntShieldOperationError("failed to write model field", err, providerName)
+	}
+
+	// Add optional fields
+	if openaiReq.Language != nil {
+		if err := writer.WriteField("language", *openaiReq.Language); err != nil {
+			return utils.NewDeepIntShieldOperationError("failed to write language field", err, providerName)
+		}
+	}
+
+	if openaiReq.Prompt != nil {
+		if err := writer.WriteField("prompt", *openaiReq.Prompt); err != nil {
+			return utils.NewDeepIntShieldOperationError("failed to write prompt field", err, providerName)
+		}
+	}
+
+	if openaiReq.ResponseFormat != nil {
+		if err := writer.WriteField("response_format", *openaiReq.ResponseFormat); err != nil {
+			return utils.NewDeepIntShieldOperationError("failed to write response_format field", err, providerName)
+		}
+	}
+
+	if openaiReq.Temperature != nil {
+		if err := writer.WriteField("temperature", fmt.Sprintf("%g", *openaiReq.Temperature)); err != nil {
+			return utils.NewDeepIntShieldOperationError("failed to write temperature field", err, providerName)
+		}
+	}
+
+	for _, granularity := range openaiReq.TimestampGranularities {
+		if err := writer.WriteField("timestamp_granularities[]", granularity); err != nil {
+			return utils.NewDeepIntShieldOperationError("failed to write timestamp_granularities field", err, providerName)
+		}
+	}
+
+	for _, include := range openaiReq.Include {
+		if err := writer.WriteField("include[]", include); err != nil {
+			return utils.NewDeepIntShieldOperationError("failed to write include field", err, providerName)
+		}
+	}
+
+	if openaiReq.Stream != nil && *openaiReq.Stream {
+		if err := writer.WriteField("stream", "true"); err != nil {
+			return utils.NewDeepIntShieldOperationError("failed to write stream field", err, providerName)
+		}
+	}
+
+	// Close the multipart writer
+	if err := writer.Close(); err != nil {
+		return utils.NewDeepIntShieldOperationError("failed to close multipart writer", err, providerName)
+	}
+
+	return nil
+}

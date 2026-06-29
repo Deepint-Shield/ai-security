@@ -1,0 +1,9 @@
+{
+  "$schema": "https://deepintshield.com/schema",
+  "config_store": {
+    "enabled": false
+  },
+  "logs_store": {
+    "enabled": false
+  }
+}

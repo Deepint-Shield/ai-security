@@ -1,0 +1,25 @@
+{
+    "$schema": "https://deepintshield.com/schema",
+    "governance": {
+        "auth_config": {
+            "admin_username": "env.DEEPINTSHIELD_ADMIN_USERNAME",
+            "admin_password": "env.DEEPINTSHIELD_ADMIN_PASSWORD",
+            "is_enabled": true,
+            "disable_auth_on_inference": false
+        }
+    },
+    "config_store": {
+        "enabled": true,
+        "type": "sqlite",
+        "config": {
+            "path": "../../examples/configs/withauth/config.db"
+        }
+    },
+    "logs_store": {
+        "enabled": true,
+        "type": "sqlite",
+        "config": {
+            "path": "../../examples/configs/withauth/logs.db"
+        }
+    }
+}

@@ -1,0 +1,614 @@
+package gemini
+
+import (
+	"encoding/base64"
+	"fmt"
+	"strings"
+
+	providerUtils "github.com/deepint-shield/ai-security/core/providers/utils"
+	"github.com/deepint-shield/ai-security/core/schemas"
+)
+
+// contentBlockMeta stores type and length of a content block for multi-turn reconstruction.
+type contentBlockMeta struct {
+	T string `json:"t"` // "thinking" or "text"
+	L int    `json:"l"` // length in UTF-8 bytes
+}
+
+// orderedTextPart tracks original Gemini part ordering for correct flattening.
+type orderedTextPart struct {
+	kind string // "thinking" or "text"
+	text string
+}
+
+// ToGeminiChatCompletionRequest converts a DeepIntShieldChatRequest to Gemini's generation request format for chat completion
+func ToGeminiChatCompletionRequest(deepintshieldReq *schemas.DeepIntShieldChatRequest) *GeminiGenerationRequest {
+	if deepintshieldReq == nil {
+		return nil
+	}
+
+	// Create the base Gemini generation request
+	geminiReq := &GeminiGenerationRequest{
+		Model: deepintshieldReq.Model,
+	}
+
+	// Convert parameters to generation config
+	if deepintshieldReq.Params != nil {
+		geminiReq.ExtraParams = deepintshieldReq.Params.ExtraParams
+		geminiReq.GenerationConfig = convertParamsToGenerationConfig(deepintshieldReq.Params, []string{}, deepintshieldReq.Model)
+		// Handle tool-related parameters
+		if len(deepintshieldReq.Params.Tools) > 0 {
+			geminiReq.Tools = convertDeepIntShieldToolsToGemini(deepintshieldReq.Params.Tools)
+
+			// Convert tool choice to tool config
+			if deepintshieldReq.Params.ToolChoice != nil {
+				geminiReq.ToolConfig = convertToolChoiceToToolConfig(deepintshieldReq.Params.ToolChoice)
+			}
+		}
+
+		// Handle extra parameters
+		if deepintshieldReq.Params.ExtraParams != nil {
+			// Safety settings
+			if safetySettings, ok := schemas.SafeExtractFromMap(deepintshieldReq.Params.ExtraParams, "safety_settings"); ok {
+				delete(geminiReq.ExtraParams, "safety_settings")
+				if settings, ok := SafeExtractSafetySettings(safetySettings); ok {
+					geminiReq.SafetySettings = settings
+				}
+			}
+
+			// Cached content
+			if cachedContent, ok := schemas.SafeExtractString(deepintshieldReq.Params.ExtraParams["cached_content"]); ok {
+				delete(geminiReq.ExtraParams, "cached_content")
+				geminiReq.CachedContent = cachedContent
+			}
+
+			// Labels
+			if labels, ok := schemas.SafeExtractFromMap(deepintshieldReq.Params.ExtraParams, "labels"); ok {
+				delete(geminiReq.ExtraParams, "labels")
+				if labelMap, ok := schemas.SafeExtractStringMap(labels); ok {
+					geminiReq.Labels = labelMap
+				}
+			}
+		}
+	}
+	// Convert chat completion messages to Gemini format
+	contents, systemInstruction := convertDeepIntShieldMessagesToGemini(deepintshieldReq.Input)
+	if systemInstruction != nil {
+		geminiReq.SystemInstruction = systemInstruction
+	}
+	geminiReq.Contents = contents
+	return geminiReq
+}
+
+// ToDeepIntShieldChatResponse converts a GenerateContentResponse to a DeepIntShieldChatResponse
+func (response *GenerateContentResponse) ToDeepIntShieldChatResponse() *schemas.DeepIntShieldChatResponse {
+	deepintshieldResp := &schemas.DeepIntShieldChatResponse{
+		ID:     response.ResponseID,
+		Model:  response.ModelVersion,
+		Object: "chat.completion",
+	}
+
+	// Set creation timestamp if available
+	if !response.CreateTime.IsZero() {
+		deepintshieldResp.Created = int(response.CreateTime.Unix())
+	}
+
+	// Handle empty candidates (filtered/malformed responses)
+	if len(response.Candidates) == 0 {
+		finishReason := ConvertGeminiFinishReasonToDeepIntShield(FinishReasonMalformedFunctionCall)
+		return createErrorResponse(response, finishReason, false)
+	}
+
+	candidate := response.Candidates[0]
+
+	// Check for filtered finish reasons that indicate errors
+	if isErrorFinishReason(candidate.FinishReason) {
+		finishReason := ConvertGeminiFinishReasonToDeepIntShield(candidate.FinishReason)
+		return createErrorResponse(response, finishReason, false)
+	}
+
+	// Collect all content and tool calls into a single message
+	var toolCalls []schemas.ChatAssistantMessageToolCall
+	var contentBlocks []schemas.ChatContentBlock
+	var reasoningDetails []schemas.ChatReasoningDetails
+	var orderedTextParts []orderedTextPart
+	var contentStr *string
+
+	// Process candidate content to extract text, tool calls, and reasoning
+	if candidate.Content != nil && len(candidate.Content.Parts) > 0 {
+		for _, part := range candidate.Content.Parts {
+			// Handle thought/reasoning text separately - add to reasoning details
+			if part.Text != "" && part.Thought {
+				reasoningDetails = append(reasoningDetails, schemas.ChatReasoningDetails{
+					Index: len(reasoningDetails),
+					Type:  schemas.DeepIntShieldReasoningDetailsTypeText,
+					Text:  &part.Text,
+				})
+				orderedTextParts = append(orderedTextParts, orderedTextPart{kind: "thinking", text: part.Text})
+				continue
+			}
+			// Handle regular text
+			if part.Text != "" {
+				contentBlocks = append(contentBlocks, schemas.ChatContentBlock{
+					Type: schemas.ChatContentBlockTypeText,
+					Text: &part.Text,
+				})
+				orderedTextParts = append(orderedTextParts, orderedTextPart{kind: "text", text: part.Text})
+				// Add thought signature to reasoning details if present with text
+				if len(part.ThoughtSignature) > 0 {
+					thoughtSig := base64.StdEncoding.EncodeToString(part.ThoughtSignature)
+					reasoningDetails = append(reasoningDetails, schemas.ChatReasoningDetails{
+						Index:     len(reasoningDetails),
+						Type:      schemas.DeepIntShieldReasoningDetailsTypeEncrypted,
+						Signature: &thoughtSig,
+					})
+				}
+			}
+			if part.FunctionCall != nil {
+				function := schemas.ChatAssistantMessageToolCallFunction{
+					Name: &part.FunctionCall.Name,
+				}
+
+				if len(part.FunctionCall.Args) > 0 {
+					function.Arguments = string(part.FunctionCall.Args)
+				}
+
+				callID := part.FunctionCall.Name
+				if part.FunctionCall.ID != "" {
+					callID = part.FunctionCall.ID
+				}
+
+				// Embed thought signature into CallID if present (matches responses.go pattern)
+				if len(part.ThoughtSignature) > 0 && !strings.Contains(callID, thoughtSignatureSeparator) {
+					encoded := base64.RawURLEncoding.EncodeToString(part.ThoughtSignature)
+					callID = fmt.Sprintf("%s%s%s", callID, thoughtSignatureSeparator, encoded)
+				}
+
+				toolCall := schemas.ChatAssistantMessageToolCall{
+					Index:    uint16(len(toolCalls)),
+					Type:     schemas.Ptr(string(schemas.ChatToolChoiceTypeFunction)),
+					ID:       &callID,
+					Function: function,
+				}
+
+				toolCalls = append(toolCalls, toolCall)
+
+				// Also add to reasoning details for backward compatibility
+				if len(part.ThoughtSignature) > 0 {
+					thoughtSig := base64.StdEncoding.EncodeToString(part.ThoughtSignature)
+					// Extract base ID without signature for reasoning detail lookup
+					baseCallID := callID
+					if strings.Contains(callID, thoughtSignatureSeparator) {
+						parts := strings.SplitN(callID, thoughtSignatureSeparator, 2)
+						if len(parts) == 2 {
+							baseCallID = parts[0]
+						}
+					}
+					reasoningDetails = append(reasoningDetails, schemas.ChatReasoningDetails{
+						Index:     len(reasoningDetails),
+						Type:      schemas.DeepIntShieldReasoningDetailsTypeEncrypted,
+						Signature: &thoughtSig,
+						ID:        schemas.Ptr(fmt.Sprintf("tool_call_%s", baseCallID)),
+					})
+				}
+			}
+
+			if part.FunctionResponse != nil {
+				// Extract the output from the response
+				output := extractFunctionResponseOutput(part.FunctionResponse)
+
+				// Add as text content block
+				if output != "" {
+					contentBlocks = append(contentBlocks, schemas.ChatContentBlock{
+						Type: schemas.ChatContentBlockTypeText,
+						Text: &output,
+					})
+					orderedTextParts = append(orderedTextParts, orderedTextPart{kind: "text", text: output})
+				}
+			}
+
+			// Handle code execution results
+			if part.CodeExecutionResult != nil {
+				output := part.CodeExecutionResult.Output
+				if part.CodeExecutionResult.Outcome != OutcomeOK {
+					output = "Error: " + output
+				}
+				if output != "" {
+					contentBlocks = append(contentBlocks, schemas.ChatContentBlock{
+						Type: schemas.ChatContentBlockTypeText,
+						Text: &output,
+					})
+					orderedTextParts = append(orderedTextParts, orderedTextPart{kind: "text", text: output})
+				}
+			}
+
+			// Handle executable code
+			if part.ExecutableCode != nil {
+				codeContent := "```" + part.ExecutableCode.Language + "\n" + part.ExecutableCode.Code + "\n```"
+				contentBlocks = append(contentBlocks, schemas.ChatContentBlock{
+					Type: schemas.ChatContentBlockTypeText,
+					Text: &codeContent,
+				})
+				orderedTextParts = append(orderedTextParts, orderedTextPart{kind: "text", text: codeContent})
+			}
+
+			// Handle standalone thought signature (not associated with function call or text)
+			if len(part.ThoughtSignature) > 0 && part.FunctionCall == nil && part.Text == "" {
+				thoughtSig := base64.StdEncoding.EncodeToString(part.ThoughtSignature)
+				reasoningDetails = append(reasoningDetails, schemas.ChatReasoningDetails{
+					Index:     len(reasoningDetails),
+					Type:      schemas.DeepIntShieldReasoningDetailsTypeEncrypted,
+					Signature: &thoughtSig,
+				})
+			}
+		}
+
+		// Build the choice with message
+		message := &schemas.ChatMessage{
+			Role: schemas.ChatMessageRoleAssistant,
+		}
+
+		if len(contentBlocks) > 0 {
+			allText := true
+			for _, block := range contentBlocks {
+				if block.Type != schemas.ChatContentBlockTypeText {
+					allText = false
+					break
+				}
+			}
+			if allText {
+				needsCombine := len(contentBlocks) > 1 || len(reasoningDetails) > 0
+				if !needsCombine {
+					// Single text block, no thinking - simple collapse
+					contentStr = contentBlocks[0].Text
+				} else {
+					// Combine thinking + text blocks into a single string, preserving original Gemini part order
+					var parts []string
+					var blockMeta []contentBlockMeta
+
+					for _, op := range orderedTextParts {
+						parts = append(parts, op.text)
+						blockMeta = append(blockMeta, contentBlockMeta{T: op.kind, L: len(op.text)})
+					}
+
+					joined := strings.Join(parts, "\n\n")
+					contentStr = &joined
+
+					// Record boundaries for multi-turn reconstruction
+					if len(blockMeta) > 1 {
+						if metaJSON, err := providerUtils.MarshalSorted(blockMeta); err == nil {
+							metaStr := string(metaJSON)
+							reasoningDetails = append(reasoningDetails, schemas.ChatReasoningDetails{
+								Index: len(reasoningDetails),
+								Type:  schemas.DeepIntShieldReasoningDetailsTypeContentBlocks,
+								Text:  &metaStr,
+							})
+						}
+					}
+
+					// Remove thinking text entries from reasoning_details (text moved into contentStr)
+					filtered := reasoningDetails[:0]
+					for _, rd := range reasoningDetails {
+						if rd.Type != schemas.DeepIntShieldReasoningDetailsTypeText {
+							rd.Index = len(filtered)
+							filtered = append(filtered, rd)
+						}
+					}
+					reasoningDetails = filtered
+				}
+				contentBlocks = nil
+			}
+		}
+
+		message.Content = &schemas.ChatMessageContent{
+			ContentStr:    contentStr,
+			ContentBlocks: contentBlocks,
+		}
+
+		if len(toolCalls) > 0 || len(reasoningDetails) > 0 {
+			message.ChatAssistantMessage = &schemas.ChatAssistantMessage{
+				ToolCalls:        toolCalls,
+				ReasoningDetails: reasoningDetails,
+			}
+		}
+
+		// Convert finish reason to DeepIntShield format.
+		// Gemini uses "STOP" for both normal text completions and tool call responses -
+		// it has no dedicated finish reason for tool calls. Override to "tool_calls" when
+		// tool calls are present so downstream consumers see a uniform signal.
+		finishReason := ConvertGeminiFinishReasonToDeepIntShield(candidate.FinishReason)
+		if len(toolCalls) > 0 && finishReason == "stop" {
+			finishReason = "tool_calls"
+		}
+
+		deepintshieldResp.Choices = append(deepintshieldResp.Choices, schemas.DeepIntShieldResponseChoice{
+			Index:        0,
+			FinishReason: &finishReason,
+			LogProbs:     ConvertGeminiLogprobsResultToDeepIntShield(candidate.LogprobsResult),
+			ChatNonStreamResponseChoice: &schemas.ChatNonStreamResponseChoice{
+				Message: message,
+			},
+		})
+	}
+
+	// Set usage information
+	deepintshieldResp.Usage = ConvertGeminiUsageMetadataToChatUsage(response.UsageMetadata)
+
+	return deepintshieldResp
+}
+
+// GeminiStreamState tracks tool-call index across streaming chunks.
+type GeminiStreamState struct {
+	nextToolCallIndex int
+	hadToolCalls      bool // true if any tool calls were seen in this stream
+}
+
+// NewGeminiStreamState returns initialised stream state for one streaming response.
+func NewGeminiStreamState() *GeminiStreamState {
+	return &GeminiStreamState{}
+}
+
+// ToDeepIntShieldChatCompletionStream converts a Gemini streaming response to a DeepIntShield Chat Completion Stream response
+// Returns the response, error (if any), and a boolean indicating if this is the last chunk
+func (response *GenerateContentResponse) ToDeepIntShieldChatCompletionStream(state *GeminiStreamState) (*schemas.DeepIntShieldChatResponse, *schemas.DeepIntShieldError, bool) {
+	if response == nil {
+		return nil, nil, false
+	}
+
+	if state == nil {
+		state = NewGeminiStreamState()
+	}
+
+	// Handle empty candidates (filtered/malformed responses)
+	if len(response.Candidates) == 0 {
+		finishReason := ConvertGeminiFinishReasonToDeepIntShield(FinishReasonMalformedFunctionCall)
+		return createErrorResponse(response, finishReason, true), nil, true
+	}
+
+	candidate := response.Candidates[0]
+
+	// Check for filtered finish reasons that indicate errors
+	if isErrorFinishReason(candidate.FinishReason) {
+		finishReason := ConvertGeminiFinishReasonToDeepIntShield(candidate.FinishReason)
+		return createErrorResponse(response, finishReason, true), nil, true
+	}
+
+	// Determine if this is the last chunk based on finish reason and usage metadata
+	isLastChunk := candidate.FinishReason != "" && response.UsageMetadata != nil
+
+	// Create the streaming response
+	streamResponse := &schemas.DeepIntShieldChatResponse{
+		ID:     response.ResponseID,
+		Model:  response.ModelVersion,
+		Object: "chat.completion.chunk",
+	}
+
+	// Set creation timestamp if available
+	if !response.CreateTime.IsZero() {
+		streamResponse.Created = int(response.CreateTime.Unix())
+	}
+
+	// Build delta content
+	delta := &schemas.ChatStreamResponseChoiceDelta{}
+
+	// Process content parts
+	if candidate.Content != nil && len(candidate.Content.Parts) > 0 {
+		// Set role from the first chunk (Gemini uses "model" for assistant)
+		if candidate.Content.Role != "" {
+			role := candidate.Content.Role
+			if role == string(RoleModel) {
+				role = string(schemas.ChatMessageRoleAssistant)
+			}
+			delta.Role = &role
+		}
+
+		var textContent string
+		var toolCalls []schemas.ChatAssistantMessageToolCall
+		var reasoningDetails []schemas.ChatReasoningDetails
+
+		for _, part := range candidate.Content.Parts {
+			switch {
+			case part.Text != "" && part.Thought:
+				// Thought/reasoning content - add to reasoning details
+				reasoningDetails = append(reasoningDetails, schemas.ChatReasoningDetails{
+					Index: len(reasoningDetails),
+					Type:  schemas.DeepIntShieldReasoningDetailsTypeText,
+					Text:  &part.Text,
+				})
+
+			case part.Text != "":
+				// Regular text content
+				textContent += part.Text
+
+			case part.FunctionCall != nil:
+				// Function call
+				jsonArgs := ""
+				if len(part.FunctionCall.Args) > 0 {
+					jsonArgs = string(part.FunctionCall.Args)
+				}
+
+				// Use ID if available, otherwise use function name
+				callID := part.FunctionCall.Name
+				if part.FunctionCall.ID != "" {
+					callID = part.FunctionCall.ID
+				}
+
+				// Embed thought signature into CallID if present
+				if len(part.ThoughtSignature) > 0 && !strings.Contains(callID, thoughtSignatureSeparator) {
+					encoded := base64.RawURLEncoding.EncodeToString(part.ThoughtSignature)
+					callID = fmt.Sprintf("%s%s%s", callID, thoughtSignatureSeparator, encoded)
+				}
+
+				toolCallIdx := state.nextToolCallIndex
+				state.nextToolCallIndex++
+
+				toolCall := schemas.ChatAssistantMessageToolCall{
+					Index: uint16(toolCallIdx),
+					Type:  schemas.Ptr(string(schemas.ChatToolTypeFunction)),
+					ID:    &callID,
+					Function: schemas.ChatAssistantMessageToolCallFunction{
+						Name:      &part.FunctionCall.Name,
+						Arguments: jsonArgs,
+					},
+				}
+
+				toolCalls = append(toolCalls, toolCall)
+
+				// Also add thought signature to reasoning details if present
+				if len(part.ThoughtSignature) > 0 {
+					thoughtSig := base64.StdEncoding.EncodeToString(part.ThoughtSignature)
+					// Extract base ID without signature for reasoning detail lookup
+					baseCallID := callID
+					if strings.Contains(callID, thoughtSignatureSeparator) {
+						parts := strings.SplitN(callID, thoughtSignatureSeparator, 2)
+						if len(parts) == 2 {
+							baseCallID = parts[0]
+						}
+					}
+					reasoningDetails = append(reasoningDetails, schemas.ChatReasoningDetails{
+						Index:     len(reasoningDetails),
+						Type:      schemas.DeepIntShieldReasoningDetailsTypeEncrypted,
+						Signature: &thoughtSig,
+						ID:        schemas.Ptr(fmt.Sprintf("tool_call_%s", baseCallID)),
+					})
+				}
+
+			case part.FunctionResponse != nil:
+				// Extract the output from the response and add to text content
+				output := extractFunctionResponseOutput(part.FunctionResponse)
+				if output != "" {
+					textContent += output
+				}
+			case part.CodeExecutionResult != nil:
+				output := part.CodeExecutionResult.Output
+				if part.CodeExecutionResult.Outcome != OutcomeOK {
+					output = "Error: " + output
+				}
+				if output != "" {
+					textContent += output
+				}
+			case part.ExecutableCode != nil:
+				codeContent := "```" + part.ExecutableCode.Language + "\n" + part.ExecutableCode.Code + "\n```"
+				textContent += codeContent
+			}
+
+			// Handle thought signature separately (not part of the switch since it can co-exist with other types)
+			if len(part.ThoughtSignature) > 0 && part.FunctionCall == nil {
+				thoughtSig := base64.StdEncoding.EncodeToString(part.ThoughtSignature)
+				reasoningDetails = append(reasoningDetails, schemas.ChatReasoningDetails{
+					Index:     len(reasoningDetails),
+					Type:      schemas.DeepIntShieldReasoningDetailsTypeEncrypted,
+					Signature: &thoughtSig,
+				})
+			}
+		}
+
+		// Set text content if present
+		if textContent != "" {
+			delta.Content = &textContent
+		}
+
+		// Set reasoning details if present
+		if len(reasoningDetails) > 0 {
+			delta.ReasoningDetails = reasoningDetails
+		}
+
+		// Set tool calls if present
+		if len(toolCalls) > 0 {
+			delta.ToolCalls = toolCalls
+			state.hadToolCalls = true
+		}
+	}
+
+	// Check if delta has any content - if not and it's not the last chunk, skip it
+	hasDeltaContent := delta.Role != nil || delta.Content != nil || len(delta.ToolCalls) > 0 || len(delta.ReasoningDetails) > 0
+	if !hasDeltaContent && !isLastChunk {
+		return nil, nil, false
+	}
+
+	// Build the choice
+	var finishReason *string
+	if isLastChunk && candidate.FinishReason != "" {
+		reason := ConvertGeminiFinishReasonToDeepIntShield(candidate.FinishReason)
+		// Gemini uses "STOP" for both text completions and tool call responses.
+		// Override to "tool_calls" when tool calls were seen in this stream for uniformity.
+		if (len(delta.ToolCalls) > 0 || state.hadToolCalls) && reason == "stop" {
+			reason = "tool_calls"
+		}
+		finishReason = &reason
+	}
+
+	choice := schemas.DeepIntShieldResponseChoice{
+		Index:        int(candidate.Index),
+		FinishReason: finishReason,
+		LogProbs:     ConvertGeminiLogprobsResultToDeepIntShield(candidate.LogprobsResult),
+		ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+			Delta: delta,
+		},
+	}
+
+	streamResponse.Choices = []schemas.DeepIntShieldResponseChoice{choice}
+
+	// Add usage information if this is the last chunk
+	if isLastChunk && response.UsageMetadata != nil {
+		streamResponse.Usage = ConvertGeminiUsageMetadataToChatUsage(response.UsageMetadata)
+	}
+
+	return streamResponse, nil, isLastChunk
+}
+
+// isErrorFinishReason checks if a finish reason indicates a filtered or error response
+func isErrorFinishReason(reason FinishReason) bool {
+	return reason == FinishReasonSafety ||
+		reason == FinishReasonRecitation ||
+		reason == FinishReasonMalformedFunctionCall ||
+		reason == FinishReasonBlocklist ||
+		reason == FinishReasonProhibitedContent ||
+		reason == FinishReasonSPII ||
+		reason == FinishReasonImageSafety ||
+		reason == FinishReasonUnexpectedToolCall
+}
+
+// createErrorResponse creates a complete DeepIntShieldChatResponse for error cases
+func createErrorResponse(response *GenerateContentResponse, finishReason string, isStream bool) *schemas.DeepIntShieldChatResponse {
+	var choice schemas.DeepIntShieldResponseChoice
+	if isStream {
+		choice = schemas.DeepIntShieldResponseChoice{
+			Index:        0,
+			FinishReason: &finishReason,
+			ChatStreamResponseChoice: &schemas.ChatStreamResponseChoice{
+				Delta: &schemas.ChatStreamResponseChoiceDelta{},
+			},
+		}
+	} else {
+		choice = schemas.DeepIntShieldResponseChoice{
+			Index:        0,
+			FinishReason: &finishReason,
+			ChatNonStreamResponseChoice: &schemas.ChatNonStreamResponseChoice{
+				Message: &schemas.ChatMessage{
+					Role:    schemas.ChatMessageRoleAssistant,
+					Content: &schemas.ChatMessageContent{},
+				},
+			},
+		}
+	}
+
+	objectType := "chat.completion"
+	if isStream {
+		objectType = "chat.completion.chunk"
+	}
+
+	errorResp := &schemas.DeepIntShieldChatResponse{
+		ID:      response.ResponseID,
+		Model:   response.ModelVersion,
+		Object:  objectType,
+		Choices: []schemas.DeepIntShieldResponseChoice{choice},
+		Usage:   ConvertGeminiUsageMetadataToChatUsage(response.UsageMetadata),
+	}
+
+	if !response.CreateTime.IsZero() {
+		errorResp.Created = int(response.CreateTime.Unix())
+	}
+
+	return errorResp
+}

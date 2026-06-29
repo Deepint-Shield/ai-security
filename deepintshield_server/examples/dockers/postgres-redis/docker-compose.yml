@@ -1,0 +1,100 @@
+services:
+  postgres:
+    image: postgres:18.3-alpine
+    container_name: deepintshield-postgres
+    environment:
+      POSTGRES_USER: deepintshield
+      POSTGRES_PASSWORD: deepintshield_password
+      POSTGRES_DB: deepintshield
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deepintshield -d deepintshield"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql
+
+  redis:
+    image: redis:8.6.1-alpine
+    container_name: deepintshield-redis
+    command: redis-server --protected-mode no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - redis_data:/data
+
+  # Deterministic guardrails runtime (regex + PII). Distroless image, so there
+  # is no compose healthcheck; the server retries the guard connection on start.
+  deepintshield-guard:
+    build:
+      context: ../../../..
+      dockerfile: deepintshield_guard/Dockerfile
+    container_name: deepintshield-guard
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DEEPINTSHIELD_GUARD_ADDR: ":8091"
+      DEEPINTSHIELD_GUARD_GRPC_ADDR: ":8092"
+    ports:
+      - "8091:8091"
+      - "8092:8092"
+
+  deepintshield-server:
+    build:
+      context: ../../../..
+      dockerfile: deepintshield_server/transports/Dockerfile.local
+      args:
+        DEEPINTSHIELD_SERVER_SOURCE_BUST: ${DEEPINTSHIELD_SERVER_SOURCE_BUST:-dev}
+    restart: unless-stopped
+    # Raise the FD cap so the gateway can sustain high RPS (the 1024 default
+    # exhausts under keep-alive + outbound provider pools).
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    container_name: deepintshield-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      deepintshield-guard:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      APP_PORT: "8080"
+      APP_HOST: "0.0.0.0"
+      LOG_LEVEL: "info"
+      LOG_STYLE: "json"
+      # Pin GOMAXPROCS to the host CPU count (automaxprocs falls back to 4
+      # without a Docker CPU quota, which caps concurrency). GOGC=200 trades a
+      # little RSS for fewer GC pauses on the hot path.
+      GOMAXPROCS: "14"
+      GOGC: "200"
+      DEEPINTSHIELD_CONFIG_FILE: "/config/config.json"
+      DEEPINTSHIELD_PGHOST: "postgres"
+      DEEPINTSHIELD_PGPORT: "5432"
+      DEEPINTSHIELD_PGUSER: "deepintshield"
+      DEEPINTSHIELD_PGPASSWORD: "deepintshield_password"
+      DEEPINTSHIELD_PGDATABASE: "deepintshield"
+      DEEPINTSHIELD_REDIS_ADDR: "redis:6379"
+      DEEPINTSHIELD_REDIS_DB: "0"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.json:/config/config.json:ro
+      - deepintshield_server_data:/app/data
+
+volumes:
+  deepintshield_server_data:
+  postgres_data:
+  redis_data:

@@ -1,0 +1,536 @@
+package mcp
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/bytedance/sonic"
+	"github.com/deepint-shield/ai-security/core/schemas"
+)
+
+
+type AgentModeExecutor struct {
+	logger schemas.Logger
+}
+
+// ExecuteAgentForChatRequest handles the agent mode execution loop for Chat API.
+// It orchestrates iterative tool execution up to the maximum depth, handling
+// auto-executable and non-auto-executable tools appropriately.
+//
+// Parameters:
+//   - ctx: Context for agent execution
+//   - maxAgentDepth: Maximum number of agent iterations allowed
+//   - originalReq: The original chat request
+//   - initialResponse: The initial chat response containing tool calls
+//   - makeReq: Function to make subsequent chat requests during agent execution
+//   - fetchNewRequestIDFunc: Optional function to generate unique request IDs for each iteration
+//   - executeToolFunc: Function to execute individual tool calls using unified MCP request/response
+//   - clientManager: Client manager for accessing MCP clients and tools
+//
+// Returns:
+//   - *schemas.DeepIntShieldChatResponse: The final response after agent execution
+//   - *schemas.DeepIntShieldError: Any error that occurred during agent execution
+func (a *AgentModeExecutor) ExecuteAgentForChatRequest(
+	ctx *schemas.DeepIntShieldContext,
+	maxAgentDepth int,
+	originalReq *schemas.DeepIntShieldChatRequest,
+	initialResponse *schemas.DeepIntShieldChatResponse,
+	makeReq func(ctx *schemas.DeepIntShieldContext, req *schemas.DeepIntShieldChatRequest) (*schemas.DeepIntShieldChatResponse, *schemas.DeepIntShieldError),
+	fetchNewRequestIDFunc func(ctx *schemas.DeepIntShieldContext) string,
+	executeToolFunc func(ctx *schemas.DeepIntShieldContext, request *schemas.DeepIntShieldMCPRequest) (*schemas.DeepIntShieldMCPResponse, error),
+	clientManager ClientManager,	
+) (*schemas.DeepIntShieldChatResponse, *schemas.DeepIntShieldError) {
+	// Create adapter for Chat API
+	adapter := &chatAPIAdapter{
+		originalReq:     originalReq,
+		initialResponse: initialResponse,
+		makeReq:         makeReq,
+	}
+
+	result, err := a.executeAgent(ctx, maxAgentDepth, adapter, fetchNewRequestIDFunc, executeToolFunc, clientManager)
+	if err != nil {
+		return nil, err
+	}
+
+	chatResponse, ok := result.(*schemas.DeepIntShieldChatResponse)
+	// Should never happen, but just in case
+	if !ok {
+		return nil, &schemas.DeepIntShieldError{
+			IsDeepIntShieldError: false,
+			Error: &schemas.ErrorField{
+				Message: "Failed to convert result to schemas.DeepIntShieldChatResponse",
+			},
+		}
+	}
+
+	return chatResponse, nil
+}
+
+// ExecuteAgentForResponsesRequest handles the agent mode execution loop for Responses API.
+// It orchestrates iterative tool execution up to the maximum depth, handling
+// auto-executable and non-auto-executable tools appropriately.
+//
+// Parameters:
+//   - ctx: Context for agent execution
+//   - maxAgentDepth: Maximum number of agent iterations allowed
+//   - originalReq: The original responses request
+//   - initialResponse: The initial responses response containing tool calls
+//   - makeReq: Function to make subsequent responses requests during agent execution
+//   - fetchNewRequestIDFunc: Optional function to generate unique request IDs for each iteration
+//   - executeToolFunc: Function to execute individual tool calls using unified MCP request/response
+//   - clientManager: Client manager for accessing MCP clients and tools
+//
+// Returns:
+//   - *schemas.DeepIntShieldResponsesResponse: The final response after agent execution
+//   - *schemas.DeepIntShieldError: Any error that occurred during agent execution
+func (a *AgentModeExecutor) ExecuteAgentForResponsesRequest(
+	ctx *schemas.DeepIntShieldContext,
+	maxAgentDepth int,
+	originalReq *schemas.DeepIntShieldResponsesRequest,
+	initialResponse *schemas.DeepIntShieldResponsesResponse,
+	makeReq func(ctx *schemas.DeepIntShieldContext, req *schemas.DeepIntShieldResponsesRequest) (*schemas.DeepIntShieldResponsesResponse, *schemas.DeepIntShieldError),
+	fetchNewRequestIDFunc func(ctx *schemas.DeepIntShieldContext) string,
+	executeToolFunc func(ctx *schemas.DeepIntShieldContext, request *schemas.DeepIntShieldMCPRequest) (*schemas.DeepIntShieldMCPResponse, error),
+	clientManager ClientManager,
+) (*schemas.DeepIntShieldResponsesResponse, *schemas.DeepIntShieldError) {
+	// Create adapter for Responses API
+	adapter := &responsesAPIAdapter{
+		originalReq:     originalReq,
+		initialResponse: initialResponse,
+		makeReq:         makeReq,
+	}
+
+	result, err := a.executeAgent(ctx, maxAgentDepth, adapter, fetchNewRequestIDFunc, executeToolFunc, clientManager)
+	if err != nil {
+		return nil, err
+	}
+
+	responsesResponse, ok := result.(*schemas.DeepIntShieldResponsesResponse)
+	// Should never happen, but just in case
+	if !ok {
+		return nil, &schemas.DeepIntShieldError{
+			IsDeepIntShieldError: false,
+			Error: &schemas.ErrorField{
+				Message: "Failed to convert result to schemas.DeepIntShieldResponsesResponse",
+			},
+		}
+	}
+
+	return responsesResponse, nil
+}
+
+// executeAgent handles the generic agent mode execution loop using an API adapter pattern.
+// It iteratively executes tools, separates auto-executable from non-auto-executable tools,
+// executes auto-executable tools in parallel, and continues the loop until no more tool
+// calls are present or the maximum depth is reached.
+//
+// Parameters:
+//   - ctx: Context for agent execution (may be modified to add request IDs)
+//   - maxAgentDepth: Maximum number of agent iterations allowed
+//   - adapter: API adapter that abstracts differences between Chat and Responses APIs
+//   - fetchNewRequestIDFunc: Optional function to generate unique request IDs for each iteration
+//   - executeToolFunc: Function to execute individual tool calls using unified MCP request/response
+//   - clientManager: Client manager for accessing MCP clients and tools
+//
+// Returns:
+//   - interface{}: The final response after agent execution (type depends on adapter)
+//   - *schemas.DeepIntShieldError: Any error that occurred during agent execution
+func (a *AgentModeExecutor) executeAgent(
+	ctx *schemas.DeepIntShieldContext,
+	maxAgentDepth int,
+	adapter agentAPIAdapter,
+	fetchNewRequestIDFunc func(ctx *schemas.DeepIntShieldContext) string,
+	executeToolFunc func(ctx *schemas.DeepIntShieldContext, request *schemas.DeepIntShieldMCPRequest) (*schemas.DeepIntShieldMCPResponse, error),
+	clientManager ClientManager,	
+) (interface{}, *schemas.DeepIntShieldError) {
+	// Get initial response from adapter
+	currentResponse := adapter.getInitialResponse()
+
+	// Create conversation history starting with original messages
+	conversationHistory := adapter.getConversationHistory()
+
+	depth := 0
+
+	// Track all executed tool results and tool calls across all iterations
+	allExecutedToolResults := make([]*schemas.ChatMessage, 0)
+	allExecutedToolCalls := make([]schemas.ChatAssistantMessageToolCall, 0)
+
+	originalRequestID, ok := ctx.Value(schemas.DeepIntShieldContextKeyRequestID).(string)
+	if ok {
+		ctx.SetValue(schemas.DeepIntShieldMCPAgentOriginalRequestID, originalRequestID)
+	}
+
+	for depth < maxAgentDepth {
+		depth++
+		toolCalls := adapter.extractToolCalls(currentResponse)
+		if len(toolCalls) == 0 {
+			break
+		}
+
+		// Separate tools into auto-executable and non-auto-executable groups
+		var autoExecutableTools []schemas.ChatAssistantMessageToolCall
+		var nonAutoExecutableTools []schemas.ChatAssistantMessageToolCall
+
+		for _, toolCall := range toolCalls {
+			if toolCall.Function.Name == nil {
+				// Skip tools without names
+				nonAutoExecutableTools = append(nonAutoExecutableTools, toolCall)
+				continue
+			}
+
+			toolName := *toolCall.Function.Name
+			client := clientManager.GetClientForTool(toolName)
+			if client == nil {
+				// Allow code mode list, read, and docs tools (all read-only operations)
+				if toolName == ToolTypeListToolFiles || toolName == ToolTypeReadToolFile || toolName == ToolTypeGetToolDocs {
+					autoExecutableTools = append(autoExecutableTools, toolCall)
+					a.logger.Debug("Tool %s can be auto-executed", toolName)
+					continue
+				} else if toolName == ToolTypeExecuteToolCode {
+					// Build allowed auto-execution tools map for code mode validation
+					allClientNames, allowedAutoExecutionTools := buildAllowedAutoExecutionTools(ctx, clientManager)
+
+					// Parse tool arguments
+					var arguments map[string]interface{}
+					if err := sonic.Unmarshal([]byte(toolCall.Function.Arguments), &arguments); err != nil {
+						a.logger.Debug("%s Failed to parse tool arguments: %v", CodeModeLogPrefix, err)
+						nonAutoExecutableTools = append(nonAutoExecutableTools, toolCall)
+						continue
+					}
+
+					code, ok := arguments["code"].(string)
+					if !ok || code == "" {
+						a.logger.Debug("%s Code parameter missing or empty", CodeModeLogPrefix)
+						nonAutoExecutableTools = append(nonAutoExecutableTools, toolCall)
+						continue
+					}
+
+					// Step 1: Convert literal \n escape sequences to actual newlines for parsing
+					codeWithNewlines := strings.ReplaceAll(code, "\\n", "\n")
+					if len(codeWithNewlines) != len(code) {
+						a.logger.Debug("%s Converted literal \\n escape sequences to actual newlines", CodeModeLogPrefix)
+					}
+
+					// Step 2: Extract tool calls from code during AST formation
+					extractedToolCalls, err := extractToolCallsFromCode(codeWithNewlines)
+					if err != nil {
+						a.logger.Debug("%s Failed to parse code for tool calls: %v", CodeModeLogPrefix, err)
+						nonAutoExecutableTools = append(nonAutoExecutableTools, toolCall)
+						continue
+					}
+
+					a.logger.Debug("%s Extracted %d tool call(s) from code", CodeModeLogPrefix, len(extractedToolCalls))
+
+					// Step 3: Validate all tool calls against allowedAutoExecutionTools
+					canAutoExecute := true
+					if len(extractedToolCalls) > 0 {
+						// If there are tool calls, we need allowedAutoExecutionTools to validate them
+						if len(allowedAutoExecutionTools) == 0 {
+							a.logger.Debug("%s Validation failed: no allowed auto-execution tools configured", CodeModeLogPrefix)
+							canAutoExecute = false
+						} else {
+							a.logger.Debug("%s Validating %d tool call(s) against %d allowed server(s)", CodeModeLogPrefix, len(extractedToolCalls), len(allowedAutoExecutionTools))
+
+							// Validate each tool call
+							for _, extractedToolCall := range extractedToolCalls {
+								isAllowed := isToolCallAllowedForCodeMode(extractedToolCall.serverName, extractedToolCall.toolName, allClientNames, allowedAutoExecutionTools)
+								if !isAllowed {
+									a.logger.Debug("%s Validation failed: tool call %s.%s not in auto-execute list", CodeModeLogPrefix, extractedToolCall.serverName, extractedToolCall.toolName)
+									canAutoExecute = false
+									break
+								}
+							}
+							if canAutoExecute {
+								a.logger.Debug("%s All tool calls validated successfully", CodeModeLogPrefix)
+							}
+						}
+					} else {
+						a.logger.Debug("%s No tool calls found in code, skipping validation", CodeModeLogPrefix)
+					}
+
+					// Add to appropriate list based on validation result
+					if canAutoExecute {
+						autoExecutableTools = append(autoExecutableTools, toolCall)
+						a.logger.Debug("Tool %s can be auto-executed (validation passed)", toolName)
+					} else {
+						nonAutoExecutableTools = append(nonAutoExecutableTools, toolCall)
+						a.logger.Debug("Tool %s cannot be auto-executed (validation failed)", toolName)
+					}
+					continue
+				}
+				// Else, if client not found, treat as non-auto-executable (can be a manually passed tool)
+				a.logger.Debug("Client not found for tool %s, treating as non-auto-executable", toolName)
+				nonAutoExecutableTools = append(nonAutoExecutableTools, toolCall)
+				continue
+			}
+
+			// Check if tool can be auto-executed
+			if canAutoExecuteTool(toolName, client.ExecutionConfig) {
+				autoExecutableTools = append(autoExecutableTools, toolCall)
+				a.logger.Debug("Tool %s can be auto-executed", toolName)
+			} else {
+				nonAutoExecutableTools = append(nonAutoExecutableTools, toolCall)
+				a.logger.Debug("Tool %s cannot be auto-executed", toolName)
+			}
+		}
+
+		a.logger.Debug("Auto-executable tools: %d", len(autoExecutableTools))
+		a.logger.Debug("Non-auto-executable tools: %d", len(nonAutoExecutableTools))
+
+		// Execute auto-executable tools first
+		var executedToolResults []*schemas.ChatMessage
+		if len(autoExecutableTools) > 0 {
+			// Add assistant message with auto-executable tool calls to conversation
+			conversationHistory = adapter.addAssistantMessage(conversationHistory, currentResponse)
+
+			// Classify each tool call as parallel-safe vs sequential based on
+			// the operator-configured safety registry. Unknown tools fall
+			// back to cfg.DefaultSafe. When the heuristic is on, two tool
+			// calls sharing an argument name also get serialized (the
+			// "output-of-A-feeds-B" indicator from the spec).
+			cfg := effectiveParallelToolConfig()
+			parallelTools, sequentialTools, classified := classifyToolCallsForParallel(autoExecutableTools, cfg)
+
+			// Stamp the per-step debug on context so PostLLMHook can copy it
+			// onto the response. Tracking via a known context key keeps the
+			// agent loop free of plugin-specific shape.
+			stepStart := time.Now()
+			perToolDuration := make([]time.Duration, len(autoExecutableTools))
+
+			// Helper that runs a single tool call and routes the result into
+			// the shared results channel. Used by both the parallel and
+			// sequential paths so behaviour is identical.
+			runToolCall := func(toolCall schemas.ChatAssistantMessageToolCall, durationIdx int, sink chan<- *schemas.ChatMessage) {
+				toolStart := time.Now()
+				mcpRequest := &schemas.DeepIntShieldMCPRequest{
+					RequestType:                  schemas.MCPRequestTypeChatToolCall,
+					ChatAssistantMessageToolCall: &toolCall,
+				}
+				mcpResponse, toolErr := executeToolFunc(ctx, mcpRequest)
+				if durationIdx >= 0 && durationIdx < len(perToolDuration) {
+					perToolDuration[durationIdx] = time.Since(toolStart)
+				}
+				if toolErr != nil {
+					a.logger.Warn("Tool execution failed: %v", toolErr)
+					sink <- createToolResultMessage(toolCall, "", toolErr)
+				} else if mcpResponse != nil && mcpResponse.ChatMessage != nil {
+					sink <- mcpResponse.ChatMessage
+				} else if mcpResponse != nil && mcpResponse.ChatMessage == nil {
+					sink <- createToolResultMessage(toolCall, "", nil)
+				} else {
+					sink <- createToolResultMessage(toolCall, "", nil)
+				}
+			}
+
+			channelToolResults := make(chan *schemas.ChatMessage, len(autoExecutableTools))
+			if !cfg.Enabled || len(sequentialTools) == 0 {
+				// Legacy behaviour: when the feature is off OR every tool is
+				// safe-for-parallel, fan everything out. Identical to the
+				// pre-feature implementation.
+				wg := sync.WaitGroup{}
+				wg.Add(len(autoExecutableTools))
+				for idx, toolCall := range autoExecutableTools {
+					go func(tc schemas.ChatAssistantMessageToolCall, i int) {
+						defer wg.Done()
+						runToolCall(tc, i, channelToolResults)
+					}(toolCall, idx)
+				}
+				wg.Wait()
+				close(channelToolResults)
+			} else {
+				// Mixed batch: parallel-safe tools fan out concurrently;
+				// sequential tools run one-at-a-time AFTER the parallel
+				// batch completes (so state-mutating tools can't race the
+				// reads). Operators who want sequential-first can flip
+				// individual entries in the registry.
+				wg := sync.WaitGroup{}
+				wg.Add(len(parallelTools))
+				for _, toolCall := range parallelTools {
+					idx := classified.indexOf(toolCall)
+					go func(tc schemas.ChatAssistantMessageToolCall, i int) {
+						defer wg.Done()
+						runToolCall(tc, i, channelToolResults)
+					}(toolCall, idx)
+				}
+				wg.Wait()
+				for _, toolCall := range sequentialTools {
+					idx := classified.indexOf(toolCall)
+					runToolCall(toolCall, idx, channelToolResults)
+				}
+				close(channelToolResults)
+			}
+
+			// Stamp parallel-tools telemetry onto the request context so the
+			// semantic_cache plugin's PostLLMHook can lift it onto the
+			// response. Sum of per-tool durations is the "serial estimate".
+			recordParallelToolsDebug(ctx, cfg.Enabled, classified, stepStart, perToolDuration)
+			_ = sequentialTools
+
+			// Collect tool results
+			executedToolResults = make([]*schemas.ChatMessage, 0, len(autoExecutableTools))
+			for toolResult := range channelToolResults {
+				executedToolResults = append(executedToolResults, toolResult)
+			}
+
+			// Track executed tool results and calls across all iterations
+			allExecutedToolResults = append(allExecutedToolResults, executedToolResults...)
+			allExecutedToolCalls = append(allExecutedToolCalls, autoExecutableTools...)
+
+			// Add tool results to conversation history
+			conversationHistory = adapter.addToolResults(conversationHistory, executedToolResults)
+		}
+
+		// If there are non-auto-executable tools, return them immediately without continuing the loop
+		if len(nonAutoExecutableTools) > 0 {
+			a.logger.Debug("Found %d non-auto-executable tools, returning them immediately without continuing the loop", len(nonAutoExecutableTools))
+			// Return as is if its the first iteration
+			if depth == 1 && len(allExecutedToolResults) == 0 {
+				return currentResponse, nil
+			}
+			// Create response with all executed tool results from all iterations, and non-auto-executable tool calls
+			return adapter.createResponseWithExecutedTools(currentResponse, allExecutedToolResults, allExecutedToolCalls, nonAutoExecutableTools), nil
+		}
+
+		// Create new request with updated conversation history
+		newReq := adapter.createNewRequest(conversationHistory)
+
+		if fetchNewRequestIDFunc != nil {
+			newID := fetchNewRequestIDFunc(ctx)
+			if newID != "" {
+				ctx.SetValue(schemas.DeepIntShieldContextKeyRequestID, newID)
+			}
+		}
+
+		// Make new LLM request
+		response, err := adapter.makeLLMCall(ctx, newReq)
+		if err != nil {
+			a.logger.Error("Agent mode: LLM request failed: %v", err)
+			return nil, err
+		}
+
+		currentResponse = response
+	}
+
+	return currentResponse, nil
+}
+
+// extractToolCalls extracts all tool calls from a chat response.
+// It iterates through all choices in the response and collects tool calls
+// from assistant messages.
+//
+// Parameters:
+//   - response: The chat response to extract tool calls from
+//
+// Returns:
+//   - []schemas.ChatAssistantMessageToolCall: List of extracted tool calls, or nil if none found
+func extractToolCalls(response *schemas.DeepIntShieldChatResponse) []schemas.ChatAssistantMessageToolCall {
+	if !hasToolCallsForChatResponse(response) {
+		return nil
+	}
+
+	var toolCalls []schemas.ChatAssistantMessageToolCall
+	for _, choice := range response.Choices {
+		if choice.ChatNonStreamResponseChoice != nil &&
+			choice.ChatNonStreamResponseChoice.Message != nil &&
+			choice.ChatNonStreamResponseChoice.Message.ChatAssistantMessage != nil {
+			toolCalls = append(toolCalls, choice.ChatNonStreamResponseChoice.Message.ChatAssistantMessage.ToolCalls...)
+		}
+	}
+
+	return toolCalls
+}
+
+// createToolResultMessage creates a tool result message from tool execution.
+// It formats the result or error into a chat message with the appropriate tool call ID.
+//
+// Parameters:
+//   - toolCall: The original tool call that was executed
+//   - result: The successful execution result (ignored if err is not nil)
+//   - err: Any error that occurred during tool execution
+//
+// Returns:
+//   - *schemas.ChatMessage: A tool message containing the execution result or error
+func createToolResultMessage(toolCall schemas.ChatAssistantMessageToolCall, result string, err error) *schemas.ChatMessage {
+	var content string
+	if err != nil {
+		content = fmt.Sprintf("Error executing tool %s: %s",
+			func() string {
+				if toolCall.Function.Name != nil {
+					return *toolCall.Function.Name
+				}
+				return "unknown"
+			}(), err.Error())
+	} else {
+		content = result
+	}
+
+	return &schemas.ChatMessage{
+		Role: schemas.ChatMessageRoleTool,
+		Content: &schemas.ChatMessageContent{
+			ContentStr: &content,
+		},
+		ChatToolMessage: &schemas.ChatToolMessage{
+			ToolCallID: toolCall.ID,
+		},
+	}
+}
+
+// buildAllowedAutoExecutionTools builds a map of client names to their auto-executable tools.
+// It processes code mode clients and parses their ToolsToAutoExecute configuration to create
+// a map of allowed tools. Tool names are parsed to match their appearance in JavaScript code.
+//
+// Parameters:
+//   - ctx: Context for accessing client tools
+//   - clientManager: Client manager for accessing MCP clients
+//
+// Returns:
+//   - []string: List of all client names
+//   - map[string][]string: Map of client names to their auto-executable tool names (as they appear in code)
+func buildAllowedAutoExecutionTools(ctx *schemas.DeepIntShieldContext, clientManager ClientManager) ([]string, map[string][]string) {
+	allowedTools := make(map[string][]string)
+	availableToolsPerClient := clientManager.GetToolPerClient(ctx)
+	allClientNames := []string{}
+
+	for clientName := range availableToolsPerClient {
+		client := clientManager.GetClientByName(clientName)
+		if client == nil {
+			continue
+		}
+		allClientNames = append(allClientNames, clientName)
+
+		// Only include code mode clients
+		if !client.ExecutionConfig.IsCodeModeClient {
+			continue
+		}
+
+		// Get auto-executable tools from config
+		toolsToAutoExecute := client.ExecutionConfig.ToolsToAutoExecute
+		if len(toolsToAutoExecute) == 0 {
+			// No auto-executable tools configured for this client
+			continue
+		}
+
+		// Parse tool names (as they appear in JavaScript code)
+		autoExecutableTools := []string{}
+		for _, originalToolName := range toolsToAutoExecute {
+			// Handle wildcard "*" - means all tools are auto-executable
+			if originalToolName == "*" {
+				autoExecutableTools = append(autoExecutableTools, "*")
+				continue
+			}
+			// Replace - with _ for code mode compatibility, then parse for JS compatibility
+			toolNameForCode := strings.ReplaceAll(originalToolName, "-", "_")
+			parsedToolName := parseToolName(toolNameForCode)
+			autoExecutableTools = append(autoExecutableTools, parsedToolName)
+		}
+
+		// Add to map if there are auto-executable tools
+		if len(autoExecutableTools) > 0 {
+			allowedTools[clientName] = autoExecutableTools
+		}
+	}
+
+	return allClientNames, allowedTools
+}

@@ -1,0 +1,29 @@
+{
+    "$schema": "https://deepintshield.com/schema",
+    "config_store": {
+      "enabled": true,
+      "type": "sqlite",
+      "config": {
+        "path": "../../tests/configs/withobservability/config.db"
+      }
+    },
+    "logs_store": {
+      "enabled": true,
+      "type": "sqlite",
+      "config": {
+        "path": "../../tests/configs/withobservability/logs.db"
+      }
+    },
+    "plugins": [
+      {
+        "enabled": true,
+        "name": "otel",
+        "config": {
+          "service_name": "deepintshield",
+          "collector_url": "http://localhost:4318/v1/traces",
+          "trace_type": "otel",
+          "protocol": "http"
+        }
+      }
+    ]
+  }

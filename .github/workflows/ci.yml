@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - production
+
+jobs:
+  go-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'
+          # actions/setup-go honors a list of go.sum files for the module cache
+          # key. Without this, every CI run re-downloads ~200 MB of modules.
+          # The go-build cache below is keyed on the same set, so an
+          # incremental-only PR usually finishes Go tests in <60 s instead of
+          # 4-5 min.
+          cache: true
+          cache-dependency-path: |
+            deepintshield_guard/go.sum
+            deepintshield_server/core/go.sum
+            deepintshield_server/framework/go.sum
+            deepintshield_server/plugins/guardrails/go.sum
+            deepintshield_server/transports/go.sum
+
+      - name: Cache Go build cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/go-build-cache
+          key: ${{ runner.os }}-gobuild-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-gobuild-
+
+      - name: Test deepintshield_guard
+        working-directory: deepintshield_guard
+        run: GOCACHE=/tmp/go-build-cache go test ./...
+
+      - name: Test deepintshield_server/core
+        # internal/mcptests is an integration suite that requires built MCP
+        # example-server binaries (see `make setup-mcp-tests` in
+        # deepintshield_server/Makefile) and Node.js runtimes. Run it locally
+        # via `make test-mcp`; CI stays on the unit-test subset.
+        working-directory: deepintshield_server/core
+        run: GOCACHE=/tmp/go-build-cache go test $(go list ./... | grep -v '/internal/mcptests')
+
+      - name: Test deepintshield_server/plugins/guardrails
+        working-directory: deepintshield_server/plugins/guardrails
+        run: GOCACHE=/tmp/go-build-cache go test ./...
+
+      # plugins/semanticcache is intentionally NOT exercised from this
+      # workflow: its vector-store tests need a Redis Stack instance with the
+      # FT.* search module (and some integration suites reach out to external
+      # vector DBs). Run them locally against the compose stack at
+      # deepintshield_server/examples/dockers/postgres-redis via
+      # `cd deepintshield_server/plugins/semanticcache && go test ./...`.
+
+      - name: Test deepintshield_server/framework plugins
+        working-directory: deepintshield_server/framework
+        run: GOCACHE=/tmp/go-build-cache go test ./plugins
+
+      - name: Test deepintshield_server/framework logstore retention
+        # Covers the background log-retention worker. framework/go.mod has
+        # `replace ... core => ../core`, so this runs cleanly from the
+        # framework subdir.
+        working-directory: deepintshield_server/framework
+        run: GOCACHE=/tmp/go-build-cache go test ./logstore/...
+
+      - name: Test deepintshield_server/core providers utils
+        # Covers the HTTP/2 shared client + per-host circuit breakers used by
+        # every outbound provider call. Lock-free atomic state, so a
+        # refactor that re-introduces a mutex would silently regress
+        # throughput. core has no replace directives because it has no
+        # local-module deps.
+        working-directory: deepintshield_server/core
+        run: GOCACHE=/tmp/go-build-cache go test ./providers/utils/...
+
+      - name: Test deepintshield_server/transports runtime packages
+        working-directory: deepintshield_server/transports
+        run: GOCACHE=/tmp/go-build-cache go test ./deepintshield-http/handlers ./deepintshield-http/lib ./deepintshield-http/server ./schema_test
