@@ -11,7 +11,7 @@ separate third-party process.
 
 ## Reporting a vulnerability
 
-Please report security issues privately to **security@deepintshield.com**.
+Please report security issues privately to **support@deepintshield.com**.
 Include reproduction steps and impact. Do not open public issues for
 suspected vulnerabilities. We aim to acknowledge within 2 business days.
 
